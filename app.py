@@ -3,6 +3,7 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+import requests
 from sklearn.ensemble import RandomForestClassifier
 import streamlit as st
 import streamlit.components.v1 as components
@@ -11,33 +12,55 @@ from xgboost import XGBClassifier
 
 warnings.filterwarnings("ignore")
 
+# --- SABİT TELEGRAM BİLGİLERİNİZ ---
+DEFAULT_TELEGRAM_TOKEN = "8898496727:AAEaArWqlYX92vLGfJUW1nHzUL-cWFC2otQ"
+DEFAULT_TELEGRAM_CHAT_ID = "1840616371"
+
 # --- SAYFA YAPILANDIRMASI ---
 st.set_page_config(
-    page_title="PRO BIST & US Yapay Zeka & Canlı Grafik Platformu",
+    page_title="PRO BIST & US Yapay Zeka Platformu",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# --- SESSION STATE (TAKİP LİSTESİ İÇİN MEMORY) ---
+# --- SESSION STATE ---
 if "watchlist" not in st.session_state:
     st.session_state.watchlist = ["ASELS", "THYAO", "TUPRS", "EREGL", "GARAN"]
 
 # --- BAŞLIK ---
 st.title("⚡ PRO Hisse Analiz & Canlı Takip Platformu")
 st.caption(
-    "Yapay Zeka Sinyalleri | TradingView Canlı Grafikleri | Kişisel Takip Listesi | Toplu Tarama"
+    "Yapay Zeka Sinyalleri | TradingView Canlı Grafikleri | Telegram Entegre Sistem"
 )
 st.divider()
 
 
+# --- TELEGRAM MESAJ GÖNDERME FONKSİYONU ---
+def send_telegram_message(bot_token, chat_id, message):
+    """Telegram Bot API üzerinden belirlenen Chat ID'ye mesaj gönderir."""
+    if not bot_token or not chat_id:
+        return False, "Bot Token veya Chat ID eksik."
+
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    payload = {"chat_id": chat_id, "text": message, "parse_mode": "Markdown"}
+
+    try:
+        response = requests.post(url, json=payload, timeout=5)
+        res_data = response.json()
+        if res_data.get("ok"):
+            return True, "Başarılı"
+        else:
+            return False, res_data.get("description", "Bilinmeyen hata")
+    except Exception as e:
+        return False, str(e)
+
+
 # --- TRADINGVIEW HTML WIDGET FONKSİYONU ---
 def render_tradingview_widget(symbol_code, is_bist=True):
-    # TradingView BIST için 'BIST:ASELS', ABD için 'NASDAQ:AAPL' veya 'NYSE:TSLA' bekler
     tv_symbol = f"BIST:{symbol_code}" if is_bist else symbol_code
 
     html_code = f"""
-    <!-- TradingView Widget BEGIN -->
     <div class="tradingview-widget-container" style="height:100%;width:100%">
       <div id="tradingview_chart" style="height:550px;width:100%"></div>
       <script type="text/javascript" src="https://s3.tradingview.com/tv.js"></script>
@@ -59,12 +82,12 @@ def render_tradingview_widget(symbol_code, is_bist=True):
       );
       </script>
     </div>
-    <!-- TradingView Widget END -->
     """
     components.html(html_code, height=560)
 
 
 # --- TEKNİK ANALİZ VE YAPAY ZEKA FONKSİYONU ---
+@st.cache_data(ttl=3600, show_spinner=False)
 def analiz_hesapla(
     symbol_input,
     model_tercihi="XGBoost",
@@ -85,7 +108,7 @@ def analiz_hesapla(
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
 
-        # İndikatörler
+        # Temel İndikatörler
         df["Return"] = df["Close"].pct_change()
         df["Volume_Change"] = df["Volume"].pct_change()
         df["Vol_SMA_Ratio"] = df["Volume"] / (
@@ -131,7 +154,7 @@ def analiz_hesapla(
         df["SMA_200"] = df["Close"].rolling(window=200).mean()
         df["Trend_200_Ratio"] = df["Close"] / (df["SMA_200"] + 1e-9)
 
-        # Target
+        # Target (Yarınki kapanış bugünkünden yüksek mi?)
         df["Target"] = np.where(df["Close"].shift(-1) > df["Close"], 1, 0)
         df_cleaned = df.replace([np.inf, -np.inf], np.nan).dropna()
 
@@ -153,9 +176,9 @@ def analiz_hesapla(
 
         if model_tercihi == "XGBoost":
             model = XGBClassifier(
-                n_estimators=200,
-                max_depth=5,
-                learning_rate=0.05,
+                n_estimators=150,
+                max_depth=4,
+                learning_rate=0.03,
                 subsample=0.8,
                 colsample_bytree=0.8,
                 random_state=42,
@@ -163,8 +186,8 @@ def analiz_hesapla(
             )
         else:
             model = RandomForestClassifier(
-                n_estimators=200,
-                max_depth=6,
+                n_estimators=150,
+                max_depth=5,
                 min_samples_split=5,
                 class_weight="balanced",
                 random_state=42,
@@ -242,22 +265,28 @@ else:
     para_birimi = "$"
     is_bist_flag = False
 
-# --- TAKİP LİSTESİ YÖNETİMİ ---
+# --- TELEGRAM AYARLARI ---
 st.sidebar.divider()
-st.sidebar.subheader("📌 Takip Listem")
-yeni_hisse = st.sidebar.text_input("Listeye Hisse Ekle:").strip().upper()
-if st.sidebar.button("➕ Ekle") and yeni_hisse:
-    if yeni_hisse not in st.session_state.watchlist:
-        st.session_state.watchlist.append(yeni_hisse)
-        st.sidebar.success(f"{yeni_hisse} eklendi!")
+st.sidebar.subheader("📲 Telegram Bildirim Ayarları")
+telegram_token = st.sidebar.text_input(
+    "Bot Token:", value=DEFAULT_TELEGRAM_TOKEN, type="password"
+)
+telegram_chat_id = st.sidebar.text_input(
+    "Chat ID:", value=DEFAULT_TELEGRAM_CHAT_ID
+)
 
-st.sidebar.caption("Mevcut Listeniz: " + ", ".join(st.session_state.watchlist))
-if st.sidebar.button("🗑️ Listeyi Temizle"):
-    st.session_state.watchlist = []
-    st.rerun()
+if st.sidebar.button("🔔 Test Mesajı Gönder"):
+    ok, msg = send_telegram_message(
+        telegram_token,
+        telegram_chat_id,
+        "🚀 *PRO BIST & US Platformu*\nTelegram bot bağlantınız başarıyla sağlandı!",
+    )
+    if ok:
+        st.sidebar.success("Test mesajı Telegram hesabınıza gönderildi!")
+    else:
+        st.sidebar.error(f"Mesaj gönderilemedi: {msg}")
 
-
-# --- SEKMELER (TABS) ---
+# --- SEKMELER ---
 tab_analiz, tab_watchlist, tab_toplu = st.tabs(
     [
         "🔍 Tekil Hisse & Canlı Grafik",
@@ -267,12 +296,12 @@ tab_analiz, tab_watchlist, tab_toplu = st.tabs(
 )
 
 # ==============================================================================
-# SEKME 1: TEKİL HİSSE VE CANLI TRADINGVIEW GRAFİĞİ
+# SEKME 1: TEKİL HİSSE ANALİZİ
 # ==============================================================================
 with tab_analiz:
     hisse_kod = (
         st.text_input(
-            "Hisse Sembolü Girin (Örn: THYAO, EREGL, NVDA, TSLA):",
+            "Hisse Sembolü Girin (Örn: THYAO, EREGL, NVDA):",
             value=varsayilan_hisse,
         )
         .strip()
@@ -291,7 +320,6 @@ with tab_analiz:
         if df_data is None:
             st.error(f"Hata: {ozet_veri}")
         else:
-            # Metrik Kartları
             c1, c2, c3, c4, c5 = st.columns(5)
             c1.metric(
                 "Son Fiyat",
@@ -310,158 +338,43 @@ with tab_analiz:
             )
             c5.metric("Model Sinyali", ozet_veri["Sinyal"])
 
-            st.markdown(
-                f"**🤖 Model ({secilen_model}) Tahmin Güveni:** `%{ozet_veri['Yükseliş İhtimali (%)']}` | **RSI:** `{ozet_veri['RSI']}` | **StochRSI:** `{ozet_veri['StochRSI']}`"
-            )
+            # Telegram Sinyal Butonu
+            if st.button("📲 Bu Analizi Telegram'a Gönder"):
+                mesaj = f"""
+🎯 *YAPAY ZEKA HİSSE SİNYALİ*
+📈 *Hisse:* `{ozet_veri['Hisse']}`
+💵 *Son Fiyat:* `{ozet_veri['Son Fiyat']} {para_birimi}` (%{ozet_veri['Günlük Değişim (%)']})
+🚥 *Sinyal:* *{ozet_veri['Sinyal']}*
+📊 *Yükseliş İhtimali:* `%{ozet_veri['Yükseliş İhtimali (%)']}`
+
+🎯 *İdeal Alış:* `{ozet_veri['İdeal Alış']} {para_birimi}`
+🛑 *Stop-Loss:* `{ozet_veri['Stop-Loss']} {para_birimi}`
+🛡️ *Destek:* `{ozet_veri['Destek S1']}` | *Direnç:* `{ozet_veri['Direnç R1']}`
+                """
+                ok, res = send_telegram_message(
+                    telegram_token, telegram_chat_id, mesaj
+                )
+                if ok:
+                    st.success("Analiz Telegram hesabınıza gönderildi!")
+                else:
+                    st.error(f"Gönderilemedi: {res}")
+
             st.divider()
-
-            # GRAFİK TÜRÜ SEÇİMİ
-            grafik_turu = st.radio(
-                "Grafik Türünü Seçin:",
-                [
-                    "📈 TradingView Canlı & İnteraktif Grafik",
-                    "📊 Plotly İndikatörlü Teknik Grafik",
-                ],
-                horizontal=True,
-            )
-
-            if "TradingView" in grafik_turu:
-                st.subheader(f"📺 TradingView Canlı Ekranı - {hisse_kod}")
-                render_tradingview_widget(hisse_kod, is_bist=is_bist_flag)
-
-            else:
-                # Plotly İndikatörlü Grafik
-                fig = make_subplots(
-                    rows=2,
-                    cols=1,
-                    shared_xaxes=True,
-                    vertical_spacing=0.05,
-                    row_heights=[0.7, 0.3],
-                )
-                fig.add_trace(
-                    go.Candlestick(
-                        x=df_data.index,
-                        open=df_data["Open"],
-                        high=df_data["High"],
-                        low=df_data["Low"],
-                        close=df_data["Close"],
-                        name="Fiyat",
-                    ),
-                    row=1,
-                    col=1,
-                )
-                fig.add_trace(
-                    go.Scatter(
-                        x=df_data.index,
-                        y=df_data["SMA_200"],
-                        line=dict(color="orange", width=1.5),
-                        name="200 SMA",
-                    ),
-                    row=1,
-                    col=1,
-                )
-                fig.add_hline(
-                    y=ozet_veri["İdeal Alış"],
-                    line_dash="dash",
-                    line_color="green",
-                    annotation_text="İdeal Alış",
-                    row=1,
-                    col=1,
-                )
-                fig.add_hline(
-                    y=ozet_veri["Destek S1"],
-                    line_dash="dot",
-                    line_color="blue",
-                    annotation_text="Destek S1",
-                    row=1,
-                    col=1,
-                )
-                fig.add_hline(
-                    y=ozet_veri["Direnç R1"],
-                    line_dash="dot",
-                    line_color="red",
-                    annotation_text="Direnç R1",
-                    row=1,
-                    col=1,
-                )
-
-                fig.add_trace(
-                    go.Scatter(
-                        x=df_data.index,
-                        y=df_data["RSI"],
-                        line=dict(color="purple", width=1.5),
-                        name="RSI (14)",
-                    ),
-                    row=2,
-                    col=1,
-                )
-                fig.add_hline(
-                    y=70, line_dash="dash", line_color="red", row=2, col=1
-                )
-                fig.add_hline(
-                    y=30, line_dash="dash", line_color="green", row=2, col=1
-                )
-
-                fig.update_layout(
-                    height=550,
-                    xaxis_rangeslider_visible=False,
-                    template="plotly_dark",
-                )
-                st.plotly_chart(fig, use_container_width=True)
+            render_tradingview_widget(hisse_kod, is_bist=is_bist_flag)
 
 # ==============================================================================
-# SEKME 2: TAKİP LİSTEM CANLI ÖZET
-# ==============================================================================
-with tab_watchlist:
-    st.subheader("⭐ Kişisel Takip Listenizdeki Hisseler")
-
-    if not st.session_state.watchlist:
-        st.info(
-            "Takip listeniz henüz boş. Sol taraftaki menüden hisse ekleyebilirsiniz."
-        )
-    else:
-        wl_sonuclar = []
-        with st.spinner("Takip listeniz güncelleniyor..."):
-            for h in st.session_state.watchlist:
-                _, ozet = analiz_hesapla(
-                    h,
-                    model_tercihi=secilen_model,
-                    is_bist=is_bist_flag,
-                    start_date="2021-01-01",
-                )
-                if ozet and isinstance(ozet, dict):
-                    wl_sonuclar.append(ozet)
-
-        if wl_sonuclar:
-            df_wl = pd.DataFrame(wl_sonuclar)
-
-            st.dataframe(
-                df_wl[
-                    [
-                        "Hisse",
-                        "Son Fiyat",
-                        "Günlük Değişim (%)",
-                        "İdeal Alış",
-                        "Sinyal",
-                        "Yükseliş İhtimali (%)",
-                        "RSI",
-                    ]
-                ].style.highlight_max(
-                    axis=0,
-                    subset=["Yükseliş İhtimali (%)"],
-                    color="darkgreen",
-                ),
-                use_container_width=True,
-            )
-
-# ==============================================================================
-# SEKME 3: TOPLU BIST TARAMASI
+# SEKME 3: TOPLU TARAMA VE OTOMATİK TELEGRAM BİLDİRİMİ
 # ==============================================================================
 with tab_toplu:
-    st.subheader("📊 Toplu Hisse Taraması")
+    st.subheader("📊 Toplu Hisse Taraması & Otomatik Sinyal Gönderimi")
     varsayilan_metin = "ASELS, TUPRS, THYAO, GARAN, AKBNK, EREGL, BIMAS, SISE, KCHOL, SAHOL, YKBNK, PETKM"
     girilen_hisseler = st.text_area(
         "Taranacak Hisse Kodları:", value=varsayilan_metin, height=100
+    )
+
+    auto_telegram = st.checkbox(
+        "⚡ Tarama sırasında yakalanan 'GÜÇLÜ AL' sinyallerini otomatik Telegram'a gönder",
+        value=True,
     )
 
     if st.button("🔍 Taramayı Başlat", type="primary"):
@@ -475,11 +388,19 @@ with tab_toplu:
             _, oz = analiz_hesapla(
                 h,
                 model_tercihi=secilen_model,
-                is_bist=True,
+                is_bist=is_bist_flag,
                 start_date="2021-01-01",
             )
             if oz and isinstance(oz, dict):
                 tarama_sonuc.append(oz)
+
+                # Otomatik Telegram Bildirimi
+                if auto_telegram and oz["Sinyal"] == "GÜÇLÜ AL":
+                    msg = f"⚡ *GÜÇLÜ AL SİNYALİ:* `{oz['Hisse']}`\n💵 Fiyat: `{oz['Son Fiyat']}` | 🎯 İdeal Alış: `{oz['İdeal Alış']}`\n📊 Yükseliş İhtimali: `%{oz['Yükseliş İhtimali (%)']}`"
+                    send_telegram_message(
+                        telegram_token, telegram_chat_id, msg
+                    )
+
             bar.progress((idx + 1) / len(h_list))
 
         bar.empty()
