@@ -3,16 +3,16 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-import sklearn.ensemble
 from sklearn.ensemble import RandomForestClassifier
 import streamlit as st
 import yfinance as yf
+from xgboost import XGBClassifier
 
 warnings.filterwarnings("ignore")
 
 # Sayfa Yapılandırması
 st.set_page_config(
-    page_title="BIST & US Hisse Analiz Platformu",
+    page_title="BIST & US Yapay Zeka Hisse Analizi",
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -21,11 +21,11 @@ st.set_page_config(
 # --- BAŞLIK VE AÇIKLAMA ---
 st.title("📈 Yapay Zeka Destekli Hisse Analiz Platformu")
 st.markdown(
-    "Makine Öğrenmesi (Random Forest), Gelişmiş Teknik İndikatörler ve Pivot Seviyeleri ile Hisse Analizi"
+    "Random Forest ve XGBoost Modelleri, Gelişmiş İndikatörler ve Pivot Seviyeleri ile Hisse Analizi"
 )
 st.divider()
 
-# --- ÖRNEK BIST POPÜLER HİSSE LİSTESİ ---
+# Popüler BIST Listesi
 VARSAYILAN_BIST_LISTESI = [
     "ASELS",
     "TUPRS",
@@ -43,7 +43,12 @@ VARSAYILAN_BIST_LISTESI = [
 
 
 # --- TEKNİK HESAPLAMA VE MODEL FONKSİYONU ---
-def analiz_hesapla(symbol_input, is_bist=True, start_date="2021-01-01"):
+def analiz_hesapla(
+    symbol_input,
+    model_tercihi="XGBoost",
+    is_bist=True,
+    start_date="2021-01-01",
+):
     symbol = (
         f"{symbol_input}.IS"
         if is_bist and not symbol_input.endswith(".IS")
@@ -106,7 +111,7 @@ def analiz_hesapla(symbol_input, is_bist=True, start_date="2021-01-01"):
         df["SMA_200"] = df["Close"].rolling(window=200).mean()
         df["Trend_200_Ratio"] = df["Close"] / (df["SMA_200"] + 1e-9)
 
-        # Target (Gelecek Gün Pozitif mi?)
+        # Target (Gelecek Gün Yükseliş mi?)
         df["Target"] = np.where(df["Close"].shift(-1) > df["Close"], 1, 0)
 
         df_cleaned = df.replace([np.inf, -np.inf], np.nan).dropna()
@@ -127,13 +132,26 @@ def analiz_hesapla(symbol_input, is_bist=True, start_date="2021-01-01"):
         X = df_cleaned[features]
         y = df_cleaned["Target"]
 
-        model = RandomForestClassifier(
-            n_estimators=200,
-            max_depth=6,
-            min_samples_split=5,
-            class_weight="balanced",
-            random_state=42,
-        )
+        # --- MODEL SEÇİMİ VE EĞİTİMİ ---
+        if model_tercihi == "XGBoost":
+            model = XGBClassifier(
+                n_estimators=200,
+                max_depth=5,
+                learning_rate=0.05,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                random_state=42,
+                eval_metric="logloss",
+            )
+        else:  # Random Forest
+            model = RandomForestClassifier(
+                n_estimators=200,
+                max_depth=6,
+                min_samples_split=5,
+                class_weight="balanced",
+                random_state=42,
+            )
+
         model.fit(X.iloc[:-1], y.iloc[:-1])
 
         latest_data = X.iloc[[-1]]
@@ -165,6 +183,7 @@ def analiz_hesapla(symbol_input, is_bist=True, start_date="2021-01-01"):
 
         ozet = {
             "Hisse": symbol_input.replace(".IS", ""),
+            "Model": model_tercihi,
             "Son Fiyat": round(latest_close, 2),
             "İdeal Alış": ideal_entry,
             "Destek S1": round(support_1, 2),
@@ -190,7 +209,13 @@ tab1, tab2 = st.tabs(
 # SEKME 1: TEKİL HİSSE ANALİZİ
 # ==============================================================================
 with tab1:
-    st.sidebar.header("⚙️ Tekil Analiz Parametreleri")
+    st.sidebar.header("⚙️ Analiz Ayarları")
+
+    secilen_model = st.sidebar.selectbox(
+        "🤖 Yapay Zeka Modeli Seçin",
+        ["XGBoost", "Random Forest"],
+        help="XGBoost trend değişimlerine daha duyarlıdır, Random Forest ise genel trendi stabil tahmin eder.",
+    )
 
     piyasa = st.sidebar.radio(
         "Piyasa Seçimi",
@@ -218,9 +243,14 @@ with tab1:
 
     if analiz_butonu or hisse_kod:
         is_bist_market = piyasa == "BIST (Türk Borsası)"
-        with st.spinner(f"{hisse_kod} hissesi analiz ediliyor..."):
+        with st.spinner(
+            f"{hisse_kod} hissesi {secilen_model} modeli ile analiz ediliyor..."
+        ):
             df_data, ozet_veri = analiz_hesapla(
-                hisse_kod, is_bist_market, baslangic_tarihi
+                hisse_kod,
+                model_tercihi=secilen_model,
+                is_bist=is_bist_market,
+                start_date=baslangic_tarihi,
             )
 
         if df_data is None:
@@ -243,7 +273,7 @@ with tab1:
             c5.metric("Model Sinyali", ozet_veri["Sinyal"])
 
             st.subheader(
-                f"🎯 Tahmin Güveni: %{ozet_veri['Yükseliş İhtimali (%)']} | RSI: {ozet_veri['RSI']} | StochRSI: {ozet_veri['StochRSI']}"
+                f"🎯 Model ({secilen_model}) Tahmin Güveni: %{ozet_veri['Yükseliş İhtimali (%)']} | RSI: {ozet_veri['RSI']} | StochRSI: {ozet_veri['StochRSI']}"
             )
             st.divider()
 
@@ -332,7 +362,7 @@ with tab1:
 with tab2:
     st.subheader("📋 Çoklu BIST Hisse Taraması")
     st.markdown(
-        "Aşağıdaki listeyi düzenleyebilir veya doğrudan **'Taramayı Başlat'** butonuna basarak tüm hisseleri analiz edebilirsiniz."
+        "Aşağıdaki listeyi düzenleyebilir, model seçebilir ve **'Taramayı Başlat'** butonuna basarak tüm hisseleri analiz edebilirsiniz."
     )
 
     varsayilan_metin = ", ".join(VARSAYILAN_BIST_LISTESI)
@@ -358,10 +388,13 @@ with tab2:
 
             for i, h_kodu in enumerate(hisse_listesi):
                 durum_metni.text(
-                    f"[{i+1}/{len(hisse_listesi)}] Analiz Ediliyor: {h_kodu}..."
+                    f"[{i+1}/{len(hisse_listesi)}] {secilen_model} ile Analiz Ediliyor: {h_kodu}..."
                 )
                 _, ozet = analiz_hesapla(
-                    h_kodu, is_bist=True, start_date="2021-01-01"
+                    h_kodu,
+                    model_tercihi=secilen_model,
+                    is_bist=True,
+                    start_date="2021-01-01",
                 )
 
                 if ozet and isinstance(ozet, dict):
@@ -375,12 +408,10 @@ with tab2:
             if sonuclar:
                 df_tarama = pd.DataFrame(sonuclar)
 
-                # Yükseliş İhtimaline göre sırala
                 df_tarama = df_tarama.sort_values(
                     by="Yükseliş İhtimali (%)", ascending=False
                 )
 
-                # Sadece GÜÇLÜ AL Verenleri Filtreleme Seçeneği
                 sadece_al = st.checkbox(
                     "Sadece 'GÜÇLÜ AL' Sinyali Verenleri Göster", value=False
                 )
@@ -392,10 +423,9 @@ with tab2:
                     df_tarama_goster = df_tarama
 
                 st.success(
-                    f"Tarama Tamamlandı! Toplam {len(df_tarama_goster)} hisse listelendi."
+                    f"Tarama Tamamlandı! ({secilen_model} kullanıldı) Toplam {len(df_tarama_goster)} hisse listelendi."
                 )
 
-                # Tablo Gösterimi
                 st.dataframe(
                     df_tarama_goster.style.highlight_max(
                         axis=0,
@@ -405,7 +435,6 @@ with tab2:
                     use_container_width=True,
                 )
 
-                # CSV İndirme
                 csv_tarama = df_tarama.to_csv(index=False).encode("utf-8-sig")
                 st.download_button(
                     label="📥 Toplu Tarama Sonuçlarını İndir (CSV)",
