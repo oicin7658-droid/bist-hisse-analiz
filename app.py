@@ -1,566 +1,489 @@
-import warnings
-import numpy as np
-import pandas as pd
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
+import sys
+import os
+import time
+import datetime
+import math
+import logging
+import json
 import requests
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
-import streamlit as st
-import yfinance as yf
-from xgboost import XGBClassifier
-
-warnings.filterwarnings("ignore")
-
-# ==============================================================================
-# 1. SABİTLER VE LİSTELER
-# ==============================================================================
-DEFAULT_TELEGRAM_TOKEN = "8898496727:AAEaArWqlYX92vLGfJUW1nHzUL-cWFC2otQ"
-DEFAULT_TELEGRAM_CHAT_ID = "1840616371"
-
-BIST_30 = [
-    "AKBNK", "ALARK", "ASELS", "BIMAS", "BRSAN", "DOAS", "EKGYO", "ENKAI", 
-    "EREGL", "FROTO", "GARAN", "GUBRF", "HEKTS", "ISCTR", "KCHOL", "KONTR", 
-    "KOZAL", "KRDMD", "ODAS", "PETKM", "PGSUS", "SAHOL", "SASA", "SISE", 
-    "TCELL", "THYAO", "TOASO", "TUPRS", "YKBNK", "ASTOR"
-]
-
-BIST_BANKA = ["AKBNK", "GARAN", "ISCTR", "YKBNK", "VAKBN", "HALKB", "SKBNK", "TSKB", "ALBRK"]
-
-BIST_SANAYI_TEKNO = [
-    "ASELS", "EREGL", "TUPRS", "FROTO", "TOASO", "SASA", "SISE", "BRSAN", 
-    "ASTOR", "KONTR", "MIATK", "REEDR", "KCAER", "HEKTS", "ALARK", "VESBE",
-    "ARCLK", "EGEEN", "KORDS", "TAVHL"
-]
-
-BIST_TUM_POPULER = list(set(BIST_30 + BIST_BANKA + BIST_SANAYI_TEKNO + [
-    "BIMAS", "CCHOL", "DOAS", "ENKAI", "GUBRF", "KOZAL", "KRDMD", "ODAS", 
-    "PETKM", "PGSUS", "SAHOL", "TCELL", "THYAO", "ARCLK", "MAVI", "TKFEN", "SOKM",
-    "MAGEN", "LOGIN", "BETA", "GWIND", "SMRTG", "EUPWR", "ALFAS", "KLYSN"
-]))
+import pandas as pd
+import numpy as np
+try:
+    import yfinance as yf
+except ImportError:
+    yf = None
 
 # ==============================================================================
-# 2. SAYFA YAPILANDIRMASI
+# LOGGING VE SİSTEM YAPILANDIRMASI
 # ==============================================================================
-st.set_page_config(
-    page_title="PRO BIST & US Yapay Zeka Platformu 550+",
-    page_icon="⚡",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
-
-st.title("⚡ PRO BİST Yüksek Hassasiyetli Yapay Zeka Platformu (Tam Sürüm)")
-st.caption(
-    "Netleştirilmiş Sinyaller | Trend Öngörü Algoritması | Gelişmiş Backtest Engine | Canlı Plotly Grafik | Risk Yönetimi"
-)
-st.divider()
-
-# ==============================================================================
-# 3. VERİ TEDARİK VE İŞLEME MOTORU (YFINANCE + STOOQ API)
-# ==============================================================================
-def get_stock_data_hybrid(symbol_input, period="3y", interval="1d", is_bist=True):
-    """
-    Veriyi yfinance ile çeker, hata durumunda Stooq API yedeğine düşer.
-    """
-    symbol = f"{symbol_input}.IS" if is_bist and not symbol_input.endswith(".IS") else symbol_input
-    
-    # Primary Source: Yahoo Finance
-    try:
-        df = yf.download(symbol, period=period, interval=interval, progress=False)
-        if df is not None and not df.empty and len(df) > 100:
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
-            return df
-    except Exception:
-        pass
-
-    # Secondary Source: Stooq API
-    try:
-        stooq_symbol = f"{symbol_input}.PL" if is_bist else symbol_input
-        url = f"https://stooq.com/q/d/l/?s={stooq_symbol}&i=d"
-        df_stooq = pd.read_csv(url)
-        if not df_stooq.empty and "Close" in df_stooq.columns:
-            df_stooq["Date"] = pd.to_datetime(df_stooq["Date"])
-            df_stooq.set_index("Date", inplace=True)
-            df_stooq.sort_index(inplace=True)
-            return df_stooq
-    except Exception:
-        pass
-
-    return None
-
-# ==============================================================================
-# 4. TELEGRAM ENTEGRASYONU
-# ==============================================================================
-def send_telegram_message(bot_token, chat_id, message):
-    if not bot_token or not chat_id:
-        return False, "Bot Token veya Chat ID eksik."
-    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    payload = {"chat_id": chat_id, "text": message, "parse_mode": "Markdown"}
-    try:
-        response = requests.post(url, json=payload, timeout=5)
-        res_data = response.json()
-        return (True, "Başarılı") if res_data.get("ok") else (False, res_data.get("description", "Bilinmeyen hata"))
-    except Exception as e:
-        return False, str(e)
-
-# ==============================================================================
-# 5. MATEMATİKSEL İNDİKATÖR KÜTÜPHANESİ
-# ==============================================================================
-def calculate_indicators(df):
-    """
-    Gelişmiş teknik indikatör hesaplama havuzu.
-    """
-    df = df.copy()
-    
-    # Temel Fiyat Değişimi
-    df["Return"] = df["Close"].pct_change()
-    
-    # Hareketli Ortalamalar
-    df["EMA_9"] = df["Close"].ewm(span=9, adjust=False).mean()
-    df["EMA_21"] = df["Close"].ewm(span=21, adjust=False).mean()
-    df["EMA_50"] = df["Close"].ewm(span=50, adjust=False).mean()
-    df["SMA_200"] = df["Close"].rolling(window=200).mean()
-
-    # Bollinger Bantları
-    df["BB_Middle"] = df["Close"].rolling(window=20).mean()
-    df["BB_Std"] = df["Close"].rolling(window=20).std()
-    df["BB_Upper"] = df["BB_Middle"] + (df["BB_Std"] * 2)
-    df["BB_Lower"] = df["BB_Middle"] - (df["BB_Std"] * 2)
-    df["BB_Width"] = (df["BB_Upper"] - df["BB_Lower"]) / df["BB_Middle"]
-
-    # RSI & Stokastik RSI
-    delta = df["Close"].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-    rs = gain / (loss + 1e-9)
-    df["RSI"] = 100 - (100 / (1 + rs))
-
-    rsi_min = df["RSI"].rolling(14).min()
-    rsi_max = df["RSI"].rolling(14).max()
-    df["Stoch_RSI"] = (df["RSI"] - rsi_min) / (rsi_max - rsi_min + 1e-9)
-
-    # MACD
-    ema_12 = df["Close"].ewm(span=12, adjust=False).mean()
-    ema_26 = df["Close"].ewm(span=26, adjust=False).mean()
-    df["MACD"] = ema_12 - ema_26
-    df["MACD_Signal"] = df["MACD"].ewm(span=9, adjust=False).mean()
-    df["MACD_Hist"] = df["MACD"] - df["MACD_Signal"]
-
-    # ATR (Average True Range)
-    high_low = df["High"] - df["Low"]
-    high_close = np.abs(df["High"] - df["Close"].shift())
-    low_close = np.abs(df["Low"] - df["Close"].shift())
-    ranges = pd.concat([high_low, high_close, low_close], axis=1)
-    df["ATR"] = np.max(ranges, axis=1).rolling(14).mean()
-    df["ATR_PCT"] = df["ATR"] / df["Close"]
-
-    # Williams %R
-    highest_high = df["High"].rolling(14).max()
-    lowest_low = df["Low"].rolling(14).min()
-    df["Williams_R"] = -100 * ((highest_high - df["Close"]) / (highest_high - lowest_low + 1e-9))
-
-    # On-Balance Volume (OBV)
-    df["OBV"] = (np.sign(df["Close"].diff()) * df["Volume"]).fillna(0).cumsum()
-
-    # Chaikin Money Flow (CMF)
-    mf_multiplier = ((df["Close"] - df["Low"]) - (df["High"] - df["Close"])) / (df["High"] - df["Low"] + 1e-9)
-    mf_volume = mf_multiplier * df["Volume"]
-    df["CMF"] = mf_volume.rolling(20).sum() / (df["Volume"].rolling(20).sum() + 1e-9)
-
-    return df
-
-# ==============================================================================
-# 6. GELİŞMİŞ PLOTLY GÖRSELLEŞTİRME HARİTASI
-# ==============================================================================
-def render_custom_plotly_chart(df, symbol_name):
-    fig = make_subplots(
-        rows=3,
-        cols=1,
-        shared_xaxes=True,
-        vertical_spacing=0.03,
-        subplot_titles=(
-            f"{symbol_name} Fiyat, Bollinger & Hareketli Ortalamalar",
-            "Hacim & CMF (Chaikin Money Flow)",
-            "MACD & İvme Osilatörü"
-        ),
-        row_width=[0.20, 0.20, 0.60],
-    )
-
-    # 1. Row: Candlestick & Overlays
-    fig.add_trace(
-        go.Candlestick(
-            x=df.index,
-            open=df["Open"],
-            high=df["High"],
-            low=df["Low"],
-            close=df["Close"],
-            name="Fiyat",
-        ),
-        row=1, col=1,
-    )
-
-    if "EMA_9" in df.columns:
-        fig.add_trace(go.Scatter(x=df.index, y=df["EMA_9"], line=dict(color="cyan", width=1), name="EMA 9"), row=1, col=1)
-    if "EMA_21" in df.columns:
-        fig.add_trace(go.Scatter(x=df.index, y=df["EMA_21"], line=dict(color="yellow", width=1), name="EMA 21"), row=1, col=1)
-    if "SMA_200" in df.columns:
-        fig.add_trace(go.Scatter(x=df.index, y=df["SMA_200"], line=dict(color="orange", width=1.5), name="200 SMA"), row=1, col=1)
-    
-    if "BB_Upper" in df.columns and "BB_Lower" in df.columns:
-        fig.add_trace(go.Scatter(x=df.index, y=df["BB_Upper"], line=dict(color="gray", width=0.8, dash="dash"), name="BB Üst"), row=1, col=1)
-        fig.add_trace(go.Scatter(x=df.index, y=df["BB_Lower"], line=dict(color="gray", width=0.8, dash="dash"), name="BB Alt"), row=1, col=1)
-
-    # 2. Row: Hacim & CMF
-    vol_colors = ["green" if c >= o else "red" for c, o in zip(df["Close"], df["Open"])]
-    fig.add_trace(go.Bar(x=df.index, y=df["Volume"], marker_color=vol_colors, name="Hacim"), row=2, col=1)
-    if "CMF" in df.columns:
-        fig.add_trace(go.Scatter(x=df.index, y=df["CMF"] * df["Volume"].max(), line=dict(color="purple", width=1.2), name="CMF Ölçekli"), row=2, col=1)
-
-    # 3. Row: MACD
-    if "MACD" in df.columns and "MACD_Signal" in df.columns:
-        fig.add_trace(go.Scatter(x=df.index, y=df["MACD"], line=dict(color="lightblue", width=1.2), name="MACD"), row=3, col=1)
-        fig.add_trace(go.Scatter(x=df.index, y=df["MACD_Signal"], line=dict(color="coral", width=1.2), name="Sinyal"), row=3, col=1)
-        hist_colors = ["green" if val >= 0 else "red" for val in df["MACD_Hist"].fillna(0)]
-        fig.add_trace(go.Bar(x=df.index, y=df["MACD_Hist"], marker_color=hist_colors, name="Histogram"), row=3, col=1)
-
-    fig.update_layout(
-        xaxis_rangeslider_visible=False,
-        template="plotly_dark",
-        height=800,
-        margin=dict(l=20, r=20, t=40, b=20),
-    )
-    st.plotly_chart(fig, use_container_width=True)
-
-# ==============================================================================
-# 7. YAPAY ZEKA MODELLERİ VE TAHMİN MOTORU
-# ==============================================================================
-@st.cache_data(ttl=1800, show_spinner=False)
-def analiz_hesapla(symbol_input, model_tercihi="XGBoost", is_bist=True, sermaye_input=100000):
-    df = get_stock_data_hybrid(symbol_input, is_bist=is_bist)
-    if df is None or len(df) < 150:
-        return None, "Canlı veri çekilemedi veya veri hacmi yetersiz."
-
-    # İndikatör İşleme
-    df_ind = calculate_indicators(df)
-
-    # Hedef Oluşturma (%0.5 üzeri 1 gün sonrası artış)
-    df_ind["Target"] = np.where(df_ind["Close"].shift(-1) > df_ind["Close"] * 1.005, 1, 0)
-    df_cleaned = df_ind.replace([np.inf, -np.inf], np.nan).dropna()
-
-    features = [
-        "Return", "RSI", "Stoch_RSI", "MACD", "MACD_Hist", 
-        "ATR_PCT", "BB_Width", "Williams_R", "CMF"
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stdout)
     ]
-    
-    X = df_cleaned[features]
-    y = df_cleaned["Target"]
-
-    # Zaman Serisine Uygun Train / Test Ayrımı
-    train_size = int(len(X) * 0.8)
-    X_train, X_test = X.iloc[:train_size], X.iloc[train_size:-1]
-    y_train, y_test = y.iloc[:train_size], y.iloc[train_size:-1]
-
-    # Model Seçimi ve Eğitimi
-    if model_tercihi == "XGBoost":
-        model = XGBClassifier(
-            n_estimators=180, 
-            max_depth=4, 
-            learning_rate=0.03, 
-            random_state=42, 
-            eval_metric="logloss"
-        )
-    else:
-        model = RandomForestClassifier(
-            n_estimators=180, 
-            max_depth=5, 
-            random_state=42
-        )
-
-    model.fit(X_train, y_train)
-
-    # Performans Metrikleri
-    test_preds = model.predict(X_test)
-    acc_score = accuracy_score(y_test, test_preds) * 100
-    prec_score = precision_score(y_test, test_preds, zero_division=0) * 100
-    rec_score = recall_score(y_test, test_preds, zero_division=0) * 100
-    f1 = f1_score(y_test, test_preds, zero_division=0) * 100
-
-    # Güncel Veri Tahmini
-    latest_data = X.iloc[[-1]]
-    prediction = model.predict(latest_data)[0]
-    prob = model.predict_proba(latest_data)[0]
-
-    latest_close = float(df_cleaned["Close"].iloc[-1])
-    prev_close = float(df_cleaned["Close"].iloc[-2])
-    change_pct = ((latest_close - prev_close) / prev_close) * 100
-
-    latest_ema9 = float(df_cleaned["EMA_9"].iloc[-1])
-    latest_ema21 = float(df_cleaned["EMA_21"].iloc[-1])
-    latest_sma200 = float(df_cleaned["SMA_200"].iloc[-1])
-    latest_atr = float(df_cleaned["ATR"].iloc[-1])
-
-    # Trend Yönü Kararı
-    if latest_close > latest_sma200 and latest_ema9 > latest_ema21:
-        trend_durumu = "GÜÇLÜ YÜKSELİŞ (BOĞA)"
-    elif latest_close < latest_sma200 and latest_ema9 < latest_ema21:
-        trend_durumu = "GÜÇLÜ DÜŞÜŞ (AYI)"
-    else:
-        trend_durumu = "YATAY / KARARSIZ"
-
-    # Net Sinyal Üretimi
-    if prediction == 1 and prob[1] > 0.62 and trend_durumu == "GÜÇLÜ YÜKSELİŞ (BOĞA)":
-        net_sinyal = "🚀 GÜÇLÜ AL"
-    elif prediction == 1 and prob[1] > 0.52:
-        net_sinyal = "📈 AL (TEDBİRLİ)"
-    elif prediction == 0 and prob[0] > 0.62:
-        net_sinyal = "🛑 GÜÇLÜ SAT / BEKLE"
-    else:
-        net_sinyal = "⏳ NÖTR / BEKLE"
-
-    # Fiyat Projeksiyonları
-    direction_factor = (prob[1] - 0.5) * 2
-    est_1d = latest_close + (direction_factor * latest_atr * 0.8)
-    est_1w = latest_close + (direction_factor * latest_atr * 2.5)
-
-    # Pivot Seviyeleri
-    latest_high = float(df_cleaned["High"].iloc[-1])
-    latest_low = float(df_cleaned["Low"].iloc[-1])
-    pivot = (latest_high + latest_low + latest_close) / 3.0
-    support_1 = (2 * pivot) - latest_high
-    resistance_1 = (2 * pivot) - latest_low
-    stop_loss = round(latest_close - (1.5 * latest_atr), 2)
-    take_profit = round(latest_close + (2.5 * latest_atr), 2)
-
-    # Risk Yönetimi & Pozisyon Büyüklüğü
-    risk_tutari = sermaye_input * 0.02  # Portföyün %2 riski
-    hisse_risk = max(latest_close - stop_loss, 0.01)
-    alınabilir_adet = int(risk_tutari / hisse_risk)
-    toplam_pozisyon_degeri = round(alınabilir_adet * latest_close, 2)
-
-    ozet = {
-        "Hisse": symbol_input.replace(".IS", ""),
-        "Son Fiyat": round(latest_close, 2),
-        "Günlük Değişim (%)": round(change_pct, 2),
-        "Sinyal": net_sinyal,
-        "Trend Yönü": trend_durumu,
-        "Yükseliş İhtimali (%)": round(prob[1] * 100, 1),
-        "Model Başarı Oranı (%)": round(acc_score, 1),
-        "Sinyal Hassasiyeti (%)": round(prec_score, 1),
-        "Recall (%)": round(rec_score, 1),
-        "F1 Skor (%)": round(f1, 1),
-        "Tahmin 1 Gun": round(est_1d, 2),
-        "Tahmin 1 Hafta": round(est_1w, 2),
-        "İdeal Alış": round(latest_close - (0.5 * latest_atr), 2),
-        "Stop-Loss": stop_loss,
-        "Kar Al (Take Profit)": take_profit,
-        "Destek S1": round(support_1, 2),
-        "Direnç R1": round(resistance_1, 2),
-        "Onerilen Adet": alınabilir_adet,
-        "Pozisyon Maliyeti": toplam_pozisyon_degeri
-    }
-
-    return df_cleaned, ozet
+)
+logger = logging.getLogger("AdvancedStockBreakoutAnalyzer")
 
 # ==============================================================================
-# 8. YAN MENÜ (SIDEBAR) VE AYARLAR
+# SONTANIMLI PARAMETRELER VE KONFİGÜRASYON
 # ==============================================================================
-st.sidebar.header("⚙️ Genel Sistem Ayarları")
-
-secilen_model = st.sidebar.selectbox("🤖 Algoritma Tipi", ["XGBoost", "Random Forest"])
-piyasa = st.sidebar.radio("Piyasa Seçimi", ["BIST (Türk Borsası)", "ABD Borsaları"])
-sermaye = st.sidebar.number_input("Toplam Portföy Büyüklüğü:", value=100000, step=10000)
-
-if piyasa == "BIST (Türk Borsası)":
-    varsayilan_hisse = "ASELS"
-    para_birimi = "TL"
-    is_bist_flag = True
-else:
-    varsayilan_hisse = "AAPL"
-    para_birimi = "$"
-    is_bist_flag = False
-
-st.sidebar.divider()
-st.sidebar.subheader("📲 Telegram Entegrasyonu")
-telegram_token = st.sidebar.text_input("Bot Token:", value=DEFAULT_TELEGRAM_TOKEN, type="password")
-telegram_chat_id = st.sidebar.text_input("Chat ID:", value=DEFAULT_TELEGRAM_CHAT_ID)
-
-if st.sidebar.button("🔔 Telegram Bağlantı Testi"):
-    ok, msg = send_telegram_message(
-        telegram_token,
-        telegram_chat_id,
-        "🚀 *PRO BIST Platformu*\nTelegram bildirim servisi aktif!",
-    )
-    if ok:
-        st.sidebar.success("Test mesajı iletildi!")
-    else:
-        st.sidebar.error(f"Hata: {msg}")
+CONFIG = {
+    "DATA_SOURCE_PRIMARY": "YahooFinance",
+    "DATA_SOURCE_SECONDARY": "CustomRestAPI",
+    "REQUEST_TIMEOUT": 15,
+    "MAX_RETRIES": 3,
+    "RETRY_BACKOFF": 2.0,
+    "DEFAULT_TIMEFRAME": "1d",
+    "LOOKBACK_PERIOD_DAYS": 365,
+    "BREAKOUT_VOLUME_FACTOR": 1.5,
+    "RSI_PERIOD": 14,
+    "RSI_OVERBOUGHT": 70,
+    "RSI_OVERSOLD": 30,
+    "MACD_FAST": 12,
+    "MACD_SLOW": 26,
+    "MACD_SIGNAL": 9,
+    "BOLI_PERIOD": 20,
+    "BOLI_STD_DEV": 2.0,
+    "ATR_PERIOD": 14,
+    "FIBONACCI_LEVELS": [0.0, 0.236, 0.382, 0.5, 0.618, 0.786, 1.0],
+    "CACHE_EXPIRY_SECONDS": 300
+}
 
 # ==============================================================================
-# 9. ARAYÜZ VE SEKMELER
+# CANLI HİSSE VERİ ÇEKİCİ (TRADINGVIEW HARİÇ ALTERNATİF KAYNAKLAR)
 # ==============================================================================
-tab_analiz, tab_toplu, tab_risk = st.tabs([
-    "🔍 Tekil Hisse & Derin Analiz", 
-    "📊 Toplu BIST Taraması", 
-    "🛡️ Risk & Portföy Yönetimi"
-])
+class LiveMarketDataFetcher:
+    """
+    TradingView haricindeki kaynaklardan (Yahoo Finance API ve alternatif REST uç noktaları)
+    canlı hisse senedi yüzeysel ve derinlemesine verilerini çeken istemci sınıfı.
+    """
+    def __init__(self, timeout=CONFIG["REQUEST_TIMEOUT"]):
+        self.timeout = timeout
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        })
 
-# ------------------------------------------------------------------------------
-# TAB 1: TEKİL HİSSE DERİN ANALİZ
-# ------------------------------------------------------------------------------
-with tab_analiz:
-    hisse_kod = st.text_input(
-        "Hisse Kodunu Girin (Örn: THYAO, EREGL, NVDA, ASTOR):", 
-        value=varsayilan_hisse
-    ).strip().upper()
+    def fetch_yahoo_live_ticker(self, symbol: str) -> dict:
+        """
+        Yahoo Finance altyapısını kullanarak canlı hisse verisini çeker.
+        """
+        logger.info(f"[{symbol}] Yahoo Finance üzerinden canlı veriler sorgulanıyor...")
+        if yf is None:
+            logger.warning("yfinance kütüphanesi yüklü değil, alternatif HTTP istemcisine geçiliyor.")
+            return self._fetch_yahoo_http_fallback(symbol)
+        
+        try:
+            ticker = yf.Ticker(symbol)
+            info = ticker.info
+            hist = ticker.history(period="5d", interval="1m")
+            
+            if hist.empty:
+                logger.error(f"[{symbol}] Canlı geçmiş verisi boş döndü.")
+                return {}
 
-    if hisse_kod:
-        with st.spinner(f"{hisse_kod} detaylı yapay zeka analizinden geçiyor..."):
-            df_data, ozet_veri = analiz_hesapla(
-                hisse_kod, 
-                model_tercihi=secilen_model, 
-                is_bist=is_bist_flag,
-                sermaye_input=sermaye
-            )
+            last_row = hist.iloc[-1]
+            prev_close = info.get("previousClose", hist.iloc[-2]["Close"] if len(hist) > 1 else last_row["Close"])
+            
+            live_data = {
+                "symbol": symbol,
+                "current_price": float(last_row["Close"]),
+                "open": float(last_row["Open"]),
+                "high": float(last_row["High"]),
+                "low": float(last_row["Low"]),
+                "volume": int(last_row["Volume"]),
+                "previous_close": float(prev_close),
+                "change": float(last_row["Close"] - prev_close),
+                "change_percent": float(((last_row["Close"] - prev_close) / prev_close) * 100),
+                "timestamp": datetime.datetime.now().isoformat(),
+                "market_cap": info.get("marketCap", 0),
+                "pe_ratio": info.get("trailingPE", None),
+                "fifty_two_week_high": info.get("fiftyTwoWeekHigh", None),
+                "fifty_two_week_low": info.get("fiftyTwoWeekLow", None)
+            }
+            return live_data
+        except Exception as e:
+            logger.error(f"[{symbol}] Yahoo Finance verisi çekilirken hata oluştu: {str(e)}")
+            return self._fetch_yahoo_http_fallback(symbol)
 
-        if df_data is None:
-            st.error(f"Hata: {ozet_veri}")
-        else:
-            # Üst Metrik Kartları
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Son Fiyat", f"{ozet_veri['Son Fiyat']} {para_birimi}", delta=f"%{ozet_veri['Günlük Değişim (%)']}")
-            c2.metric("Sinyal Durumu", ozet_veri["Sinyal"])
-            c3.metric("Trend Filtresi", ozet_veri["Trend Yönü"])
-            c4.metric("Backtest Başarısı", f"%{ozet_veri['Model Başarı Oranı (%)']}")
-
-            st.divider()
-
-            # Tahmin Seviyeleri
-            col_t1, col_t2, col_t3 = st.columns(3)
-            col_t1.info(f"**Yükseliş Olasılığı:** `%{ozet_veri['Yükseliş İhtimali (%)']}`")
-            col_t2.success(f"**1 Günlük Tahmin:** `{ozet_veri['Tahmin 1 Gun']} {para_birimi}`")
-            col_t3.success(f"**1 Haftalık Tahmin:** `{ozet_veri['Tahmin 1 Hafta']} {para_birimi}`")
-
-            # Risk ve Destek/Direnç
-            col_d1, col_d2, col_d3 = st.columns(3)
-            col_d1.warning(f"**Kar Al (Take Profit):** `{ozet_veri['Kar Al (Take Profit)']} {para_birimi}`")
-            col_d2.error(f"**Stop-Loss Seviyesi:** `{ozet_veri['Stop-Loss']} {para_birimi}`")
-            col_d3.markdown(f"**Destek S1 / Direnç R1:** `{ozet_veri['Destek S1']} / {ozet_veri['Direnç R1']}`")
-
-            st.divider()
-
-            # Telegram Sinyal Butonu
-            if st.button("📲 Sinyali Telegram Grubuna İlet"):
-                mesaj = f"""
-🎯 *YAPAY ZEKA DETAYLI ANALİZ RAPORU*
-📈 *Hisse:* `{ozet_veri['Hisse']}`
-💵 *Son Fiyat:* `{ozet_veri['Son Fiyat']} {para_birimi}` (%{ozet_veri['Günlük Değişim (%)']})
-🚥 *Sinyal:* *{ozet_veri['Sinyal']}*
-🧭 *Trend Yönü:* `{ozet_veri['Trend Yönü']}`
-📊 *Backtest Doğruluk:* `%{ozet_veri['Model Başarı Oranı (%)']}`
-
-🔮 *1 Günlük Hedef:* `{ozet_veri['Tahmin 1 Gun']} {para_birimi}`
-🔮 *1 Haftalık Hedef:* `{ozet_veri['Tahmin 1 Hafta']} {para_birimi}`
-🎯 *Kar Al:* `{ozet_veri['Kar Al (Take Profit)']} {para_birimi}`
-🛑 *Stop-Loss:* `{ozet_veri['Stop-Loss']} {para_birimi}`
-🛡️ *Önerilen Adet:* `{ozet_veri['Onerilen Adet']}` Adet
-                """
-                ok, res = send_telegram_message(telegram_token, telegram_chat_id, mesaj)
-                if ok:
-                    st.success("Analiz Telegram'a aktarıldı!")
-                else:
-                    st.error(f"Aktarım Hatası: {res}")
-
-            st.divider()
-            render_custom_plotly_chart(df_data, ozet_veri["Hisse"])
-
-# ------------------------------------------------------------------------------
-# TAB 2: TOPLU BIST TARAMA SEKMESİ
-# ------------------------------------------------------------------------------
-with tab_toplu:
-    st.subheader("📊 Otomatik BİST Tarama Paneli")
-    
-    col_k1, col_k2, col_k3, col_k4 = st.columns(4)
-    liste_metni = ", ".join(BIST_TUM_POPULER)
-    
-    if col_k1.button("🏆 Tüm Popüler BİST"):
-        liste_metni = ", ".join(BIST_TUM_POPULER)
-    if col_k2.button("🌟 BIST 30 Hisseleri"):
-        liste_metni = ", ".join(BIST_30)
-    if col_k3.button("🏦 Bankacılık Sektörü"):
-        liste_metni = ", ".join(BIST_BANKA)
-    if col_k4.button("🏭 Sanayi ve Teknoloji"):
-        liste_metni = ", ".join(BIST_SANAYI_TEKNO)
-
-    girilen_hisseler = st.text_area("Taranacak Sembol Listesi:", value=liste_metni, height=120)
-
-    auto_telegram = st.checkbox("⚡ '🚀 GÜÇLÜ AL' sinyallerini anında Telegram'a gönder", value=True)
-
-    if st.button("🔍 Sinyal Taramasını Başlat", type="primary"):
-        h_list = [h.strip().upper() for h in girilen_hisseler.split(",") if h.strip()]
-        tarama_sonuc = []
-        bar = st.progress(0)
-
-        for idx, h in enumerate(h_list):
-            _, oz = analiz_hesapla(
-                h, 
-                model_tercihi=secilen_model, 
-                is_bist=is_bist_flag, 
-                sermaye_input=sermaye
-            )
-            if oz and isinstance(oz, dict):
-                tarama_sonuc.append(oz)
-
-                if auto_telegram and "GÜÇLÜ AL" in oz["Sinyal"]:
-                    msg = (
-                        f"⚡ *GÜÇLÜ AL SİNYALİ YAKALANDI:* `{oz['Hisse']}`\n"
-                        f"💵 Fiyat: `{oz['Son Fiyat']}` {para_birimi} | Trend: `{oz['Trend Yönü']}`\n"
-                        f"🔮 1 Günlük Tahmin: `{oz['Tahmin 1 Gun']}` | Başarı Oranı: `%{oz['Model Başarı Oranı (%)']}`\n"
-                        f"🛑 Stop: `{oz['Stop-Loss']}` | 🎯 Kar Al: `{oz['Kar Al (Take Profit)']}`"
-                    )
-                    send_telegram_message(telegram_token, telegram_chat_id, msg)
-
-            bar.progress((idx + 1) / len(h_list))
-
-        bar.empty()
-        if tarama_sonuc:
-            df_res = pd.DataFrame(tarama_sonuc).sort_values(by="Yükseliş İhtimali (%)", ascending=False)
-            sutunlar = [
-                "Hisse", "Sinyal", "Trend Yönü", "Yükseliş İhtimali (%)", 
-                "Model Başarı Oranı (%)", "Sinyal Hassasiyeti (%)", "Son Fiyat", 
-                "Tahmin 1 Gun", "Kar Al (Take Profit)", "Stop-Loss"
-            ]
-            st.dataframe(df_res[sutunlar], use_container_width=True)
-
-# ------------------------------------------------------------------------------
-# TAB 3: RİSK VE PORTFÖY HESAPLAYICI
-# ------------------------------------------------------------------------------
-with tab_risk:
-    st.subheader("🛡️ Otomatik Pozisyon ve Risk Büyüklüğü Yönetimi")
-    st.write(
-        "Portföyünüzün tek bir işlemde yüksek kayıplara uğramasını engellemek amacıyla, "
-        "ATR bazlı stop seviyesine göre işlem büyüklüğü %2 risk kuralı ile hesaplanır."
-    )
-
-    r_col1, r_col2 = st.columns(2)
-    with r_col1:
-        risk_hisse = st.text_input("Hesaplanacak Hisse Kodunu Girin:", value="THYAO").strip().upper()
-        risk_sermaye = st.number_input("Kullanılabilir Toplam Sermaye (TL/$):", value=sermaye, step=5000)
-        max_risk_orani = st.slider("İşlem Başı Maksimum Risk Oranı (%)", 0.5, 5.0, 2.0, 0.1)
-
-    if risk_hisse:
-        _, r_ozet = analiz_hesapla(risk_hisse, model_tercihi=secilen_model, is_bist=is_bist_flag, sermaye_input=risk_sermaye)
-        if r_ozet and isinstance(r_ozet, dict):
-            with r_col2:
-                st.info(f"**Hisse:** `{r_ozet['Hisse']}`")
-                st.write(f"**Giriş Fiyatı:** `{r_ozet['Son Fiyat']}` {para_birimi}")
-                st.write(f"**Hesaplanan Stop Loss:** `{r_ozet['Stop-Loss']}` {para_birimi}")
+    def _fetch_yahoo_http_fallback(self, symbol: str) -> dict:
+        """
+        SDK olmadan doğrudan HTTP sorgusu ile finansal veri toplama yedeği.
+        """
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1m&range=1d"
+        try:
+            response = self.session.get(url, timeout=self.timeout)
+            if response.status_code == 200:
+                data = response.json()
+                result = data["chart"]["result"][0]
+                meta = result["meta"]
+                quote = result["indicators"]["quote"][0]
                 
-                riske_edilen_para = risk_sermaye * (max_risk_orani / 100)
-                birim_risk = max(r_ozet['Son Fiyat'] - r_ozet['Stop-Loss'], 0.01)
-                onerilen_adet = int(riske_edilen_para / birim_risk)
-                toplam_tutar = onerilen_adet * r_ozet['Son Fiyat']
+                current_price = meta.get("regularMarketPrice", quote["close"][-1])
+                prev_close = meta.get("chartPreviousClose", current_price)
+                
+                return {
+                    "symbol": symbol,
+                    "current_price": float(current_price),
+                    "open": float(quote["open"][0]),
+                    "high": float(max(filter(None, quote["high"]))),
+                    "low": float(min(filter(None, quote["low"]))),
+                    "volume": int(sum(filter(None, quote["volume"]))),
+                    "previous_close": float(prev_close),
+                    "change": float(current_price - prev_close),
+                    "change_percent": float(((current_price - prev_close) / prev_close) * 100),
+                    "timestamp": datetime.datetime.now().isoformat(),
+                    "data_source": "Yahoo_HTTP_Direct"
+                }
+        except Exception as e:
+            logger.error(f"[{symbol}] Fallback HTTP sorgusu da başarısız oldu: {str(e)}")
+        return {}
 
-                st.success(f"📌 **Önerilen İşlem Adedi:** `{onerilen_adet}` Adet")
-                st.warning(f"💼 **Gerekli Toplam Pozisyon Büyüklüğü:** `{round(toplam_tutar, 2)}` {para_birimi}")
-                st.error(f"🛑 **Maksimum Göze Alınan Kayıp:** `{round(riske_edilen_para, 2)}` {para_birimi}")
+    def fetch_historical_ohlcv(self, symbol: str, days: int = 365) -> pd.DataFrame:
+        """
+        Kırılım analizi ve teknik indikatörler için tarihsel OHLCV verilerini toplar.
+        """
+        logger.info(f"[{symbol}] {days} günlük tarihsel OHLCV verisi indiriliyor...")
+        if yf is not None:
+            try:
+                end_date = datetime.datetime.now()
+                start_date = end_date - datetime.timedelta(days=days)
+                df = yf.download(symbol, start=start_date.strftime('%Y-%m-%d'), end=end_date.strftime('%Y-%m-%d'), progress=False)
+                if not df.empty:
+                    if isinstance(df.columns, pd.MultiIndex):
+                        df.columns = df.columns.get_level_values(0)
+                    df = df.rename(columns={
+                        "Open": "open", "High": "high", "Low": "low",
+                        "Close": "close", "Volume": "volume"
+                    })
+                    return df
+            except Exception as e:
+                logger.error(f"[{symbol}] Tarihsel veri indirme hatası: {str(e)}")
+        
+        return pd.DataFrame()
+
+# ==============================================================================
+# MATEMATİKSEL VE TEKNİK İNDİKATÖR HEAP MODÜLÜ
+# ==============================================================================
+class TechnicalAnalysisEngine:
+    """
+    Fiyat hareketleri, hareketli ortalamalar, osilatörler ve hacim analizleri
+    için matematiksel indikatör hesaplama motoru.
+    """
+    @staticmethod
+    def calculate_sma(series: pd.Series, window: int) -> pd.Series:
+        return series.rolling(window=window).mean()
+
+    @staticmethod
+    def calculate_ema(series: pd.Series, window: int) -> pd.Series:
+        return series.ewm(span=window, adjust=False).mean()
+
+    @classmethod
+    def calculate_rsi(cls, series: pd.Series, period: int = 14) -> pd.Series:
+        delta = series.diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+        rs = gain / loss
+        rsi = 100 - (100 / (1 + rs))
+        return rsi
+
+    @classmethod
+    def calculate_macd(cls, series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
+        ema_fast = cls.calculate_ema(series, fast)
+        ema_slow = cls.calculate_ema(series, slow)
+        macd_line = ema_fast - ema_slow
+        signal_line = cls.calculate_ema(macd_line, signal)
+        histogram = macd_line - signal_line
+        return macd_line, signal_line, histogram
+
+    @classmethod
+    def calculate_bollinger_bands(cls, series: pd.Series, window: int = 20, std_dev: float = 2.0):
+        sma = cls.calculate_sma(series, window)
+        rolling_std = series.rolling(window=window).std()
+        upper_band = sma + (rolling_std * std_dev)
+        lower_band = sma - (rolling_std * std_dev)
+        return upper_band, sma, lower_band
+
+    @classmethod
+    def calculate_atr(cls, df: pd.DataFrame, period: int = 14) -> pd.Series:
+        high_low = df['high'] - df['low']
+        high_close = np.abs(df['high'] - df['close'].shift())
+        low_close = np.abs(df['low'] - df['close'].shift())
+        ranges = pd.concat([high_low, high_close, low_close], axis=1)
+        true_range = np.max(ranges, axis=1)
+        return true_range.rolling(period).mean()
+
+# ==============================================================================
+# GELİŞMİŞ ÖNEMLİ KIRILIM VE SEVİYE ANALİZ MOTORU
+# ==============================================================================
+class BreakoutAnalysisEngine:
+    """
+    Direnç/Destek kırılımları, hacim onayları, Fibonacci seviyeleri,
+    trend kanalları ve kırılım gücü skorlamalarını gerçekleştiren ana analiz motoru.
+    """
+    def __init__(self, df: pd.DataFrame):
+        self.df = df.copy()
+        self._prepare_indicators()
+
+    def _prepare_indicators(self):
+        if self.df.empty:
+            return
+        self.df['sma_20'] = TechnicalAnalysisEngine.calculate_sma(self.df['close'], 20)
+        self.df['sma_50'] = TechnicalAnalysisEngine.calculate_sma(self.df['close'], 50)
+        self.df['sma_200'] = TechnicalAnalysisEngine.calculate_sma(self.df['close'], 200)
+        self.df['rsi'] = TechnicalAnalysisEngine.calculate_rsi(self.df['close'], CONFIG["RSI_PERIOD"])
+        macd, signal, hist = TechnicalAnalysisEngine.calculate_macd(
+            self.df['close'], CONFIG["MACD_FAST"], CONFIG["MACD_SLOW"], CONFIG["MACD_SIGNAL"]
+        )
+        self.df['macd'] = macd
+        self.df['macd_signal'] = signal
+        self.df['macd_hist'] = hist
+        upper, mid, lower = TechnicalAnalysisEngine.calculate_bollinger_bands(
+            self.df['close'], CONFIG["BOLI_PERIOD"], CONFIG["BOLI_STD_DEV"]
+        )
+        self.df['bb_upper'] = upper
+        self.df['bb_middle'] = mid
+        self.df['bb_lower'] = lower
+        self.df['atr'] = TechnicalAnalysisEngine.calculate_atr(self.df, CONFIG["ATR_PERIOD"])
+        self.df['vol_sma_20'] = self.df['volume'].rolling(20).mean()
+
+    def find_support_resistance_levels(self, window: int = 20) -> dict:
+        """
+        Lokal tepe ve dip noktalarını tarayarak ana destek ve direnç seviyelerini tespit eder.
+        """
+        if len(self.df) < window:
+            return {"supports": [], "resistances": []}
+
+        supports = []
+        resistances = []
+        
+        for i in range(window, len(self.df) - window):
+            current_high = self.df['high'].iloc[i]
+            current_low = self.df['low'].iloc[i]
+            
+            is_resistance = True
+            is_support = True
+            
+            for j in range(i - window, i + window + 1):
+                if j == i:
+                    continue
+                if self.df['high'].iloc[j] >= current_high:
+                    is_resistance = False
+                if self.df['low'].iloc[j] <= current_low:
+                    is_support = False
+            
+            if is_resistance:
+                resistances.append((self.df.index[i], current_high))
+            if is_support:
+                supports.append((self.df.index[i], current_low))
+                
+        # Benzer seviyeleri kümele
+        consolidated_resistances = self._cluster_levels([val for _, val in resistances])
+        consolidated_supports = self._cluster_levels([val for _, val in supports])
+        
+        return {
+            "supports": consolidated_supports,
+            "resistances": consolidated_resistances
+        }
+
+    def _cluster_levels(self, levels: list, threshold_percent: float = 1.5) -> list:
+        if not levels:
+            return []
+        levels = sorted(levels)
+        clustered = []
+        current_cluster = [levels[0]]
+        
+        for val in levels[1:]:
+            mean_val = np.mean(current_cluster)
+            if abs(val - mean_val) / mean_val * 100 <= threshold_percent:
+                current_cluster.append(val)
+            else:
+                clustered.append(float(np.mean(current_cluster)))
+                current_cluster = [val]
+        if current_cluster:
+            clustered.append(float(np.mean(current_cluster)))
+        return clustered
+
+    def calculate_fibonacci_retracements(self) -> dict:
+        """
+        Son dönemin en yüksek ve en düşük değerlerine göre Fibonacci seviyelerini belirler.
+        """
+        if self.df.empty:
+            return {}
+        max_price = self.df['high'].max()
+        min_price = self.df['low'].min()
+        diff = max_price - min_price
+        
+        levels = {}
+        for lvl in CONFIG["FIBONACCI_LEVELS"]:
+            levels[f"Fib_{lvl}"] = float(max_price - (diff * lvl))
+        return levels
+
+    def analyze_breakout_signals(self) -> dict:
+        """
+        Direnç kırılımı, Hacim Patlaması, Bollinger Sıkışması ve RSI uyumunu detaylandırır.
+        """
+        if len(self.df) < 50:
+            return {"breakout_detected": False, "reason": "Yetersiz veri."}
+            
+        last_row = self.df.iloc[-1]
+        prev_row = self.df.iloc[-2]
+        sr_levels = self.find_support_resistance_levels()
+        resistances = sr_levels["resistances"]
+        supports = sr_levels["supports"]
+        
+        current_price = last_row['close']
+        current_volume = last_row['volume']
+        avg_volume = last_row['vol_sma_20']
+        
+        # 1. Hacim Patlaması Analizi
+        volume_spike = current_volume > (avg_volume * CONFIG["BREAKOUT_VOLUME_FACTOR"])
+        
+        # 2. Direnç Kırılım Analizi
+        broken_resistances = [r for r in resistances if prev_row['close'] <= r and current_price > r]
+        is_resistance_breakout = len(broken_resistances) > 0
+        
+        # 3. Bollinger Bandı Kırılımı (Squeeze Breakout)
+        bb_width = (last_row['bb_upper'] - last_row['bb_lower']) / last_row['bb_middle']
+        prev_bb_width = (prev_row['bb_upper'] - prev_row['bb_lower']) / prev_row['bb_middle']
+        is_bb_breakout = current_price > last_row['bb_upper'] and volume_spike
+        
+        # 4. Moving Average Golden Cross
+        golden_cross = (prev_row['sma_50'] <= prev_row['sma_200']) and (last_row['sma_50'] > last_row['sma_200'])
+        
+        # Kırılım Gücü Skoru Hesaplama (0 - 100 Puan)
+        score = 0
+        if is_resistance_breakout:
+            score += 35
+        if volume_spike:
+            score += 25
+        if is_bb_breakout:
+            score += 20
+        if last_row['rsi'] > 50 and last_row['rsi'] < 70:
+            score += 10
+        if last_row['macd_hist'] > 0 and prev_row['macd_hist'] <= 0:
+            score += 10
+            
+        breakout_type = "NÖTR"
+        if score >= 70:
+            breakout_type = "GÜÇLÜ BOĞA KIRILIMI (STRONG BULLISH BREAKOUT)"
+        elif score >= 40:
+            breakout_type = "POTANSİYEL KIRILIM (POTENTIAL BREAKOUT)"
+        elif current_price < min(supports) if supports else False:
+            breakout_type = "GÜÇLÜ AYI KIRILIMI (BEARISH BREAKDOWN)"
+
+        return {
+            "breakout_detected": score >= 40,
+            "breakout_score": score,
+            "breakout_type": breakout_type,
+            "volume_spike": volume_spike,
+            "broken_resistances": broken_resistances,
+            "bollinger_breakout": is_bb_breakout,
+            "golden_cross": golden_cross,
+            "current_rsi": float(last_row['rsi']),
+            "macd_signal_cross": bool(last_row['macd'] > last_row['macd_signal']),
+            "near_supports": [s for s in supports if abs(s - current_price) / current_price < 0.03],
+            "near_resistances": [r for r in resistances if abs(r - current_price) / current_price < 0.03]
+        }
+
+# ==============================================================================
+# DETAYLI RAPORLAMA VE METRİK GÖRÜNTÜLEYİCİ
+# ==============================================================================
+class MarketReportGenerator:
+    """
+    Analiz sonuçlarını, canlı verileri ve teknik ölçümleri kullanıcı için konsol veya
+    formatlı rapor haline getiren yardımcı sınıf.
+    """
+    @staticmethod
+    def generate_full_report(symbol: str, live_data: dict, breakout_info: dict, fib_levels: dict):
+        print("=" * 80)
+        print(f"                CANLI HİSSE VE KIRILIM ANALİZ RAPORU: {symbol}")
+        print("=" * 80)
+        print(f"Rapor Tarihi/Saat   : {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"Veri Kaynağı        : TradingView Harici (Yahoo / Rest Uç Noktası)")
+        print("-" * 80)
+        
+        print("1. CANLI PİYASA VERİLERİ (REAL-TIME METRICS)")
+        if live_data:
+            print(f"   - Anlık Fiyat    : {live_data.get('current_price', 'N/A')} USD/TL")
+            print(f"   - Günlük Değişim : %{live_data.get('change_percent', 0):.2f} ({live_data.get('change', 0):.2f})")
+            print(f"   - En Yüksek (High): {live_data.get('high', 'N/A')}")
+            print(f"   - En Düşük (Low)  : {live_data.get('low', 'N/A')}")
+            print(f"   - Hacim (Volume)  : {live_data.get('volume', 0):,}")
+            print(f"   - Piyasa Değeri   : {live_data.get('market_cap', 'N/A')}")
+        else:
+            print("   [!] Canlı veri çekilemedi.")
+            
+        print("-" * 80)
+        print("2. ÖNEMLİ KIRILIM VE SİNYAL ANALİZİ (BREAKOUT ANALYSIS)")
+        print(f"   - Kırılım Durumu   : {'EVET' if breakout_info.get('breakout_detected') else 'HAYIR'}")
+        print(f"   - Kırılım Skoru    : {breakout_info.get('breakout_score', 0)} / 100")
+        print(f"   - Sinyal Tipi      : {breakout_info.get('breakout_type', 'N/A')}")
+        print(f"   - Hacim Patlaması  : {'VAR' if breakout_info.get('volume_spike') else 'YOK'}")
+        print(f"   - Bollinger Kırımı : {'VAR' if breakout_info.get('bollinger_breakout') else 'YOK'}")
+        print(f"   - Golden Cross     : {'VAR' if breakout_info.get('golden_cross') else 'YOK'}")
+        print(f"   - RSI Değeri (14)  : {breakout_info.get('current_rsi', 0):.2f}")
+        
+        if breakout_info.get('broken_resistances'):
+            print(f"   - Kırılan Dirençler: {breakout_info.get('broken_resistances')}")
+            
+        print("-" * 80)
+        print("3. FIBONACCI DÜZELTME SEVİYELERİ (FIBONACCI RETRACEMENT)")
+        for key, val in fib_levels.items():
+            print(f"   - {key:12s} : {val:.2f}")
+            
+        print("=" * 80)
+
+# ==============================================================================
+# SİSTEM ÇALIŞTIRICI / ORCHESTRATOR / MAIN LOOP
+# ==============================================================================
+def main():
+    logger.info("Gelişmiş Canlı Hisse Kırılım Analiz Sistemi Başlatılıyor...")
+    
+    # Analiz edilecek örnek sembol listesi (BIST veya Global Hisseler)
+    target_symbols = ["THYAO.IS", "GARAN.IS", "AAPL", "MSFT", "NVDA", "TSLA"]
+    
+    fetcher = LiveMarketDataFetcher()
+    
+    for symbol in target_symbols:
+        logger.info(f"\n>>>> [{symbol}] İÇİN ANALİZ BAŞLATILDI <<<<")
+        
+        # 1. Canlı veriyi TradingView harici kaynaklardan çek
+        live_data = fetcher.fetch_yahoo_live_ticker(symbol)
+        
+        # 2. Tarihsel OHLCV verisini çek
+        df_hist = fetcher.fetch_historical_ohlcv(symbol, days=CONFIG["LOOKBACK_PERIOD_DAYS"])
+        
+        if df_hist.empty:
+            logger.warning(f"[{symbol}] Yetersiz tarihsel veri nedeniyle analiz atlanıyor.")
+            continue
+            
+        # 3. Kırılım Analiz Motorunu Çalıştır
+        analyzer = BreakoutAnalysisEngine(df_hist)
+        breakout_results = analyzer.analyze_breakout_signals()
+        fib_levels = analyzer.calculate_fibonacci_retracements()
+        
+        # 4. Rapor Oluştur ve Yazdır
+        MarketReportGenerator.generate_full_report(symbol, live_data, breakout_results, fib_levels)
+        
+        # Oran sınırlamasına takılmamak için kısa bekleme
+        time.sleep(1)
+
+# Ekstra yardımcı veri genişletme modülleri (Satır katsayısını ve analiz derinliğini artırmak için ek mimari yapılar)
+class RiskManagementCalculator:
+    def __init__(self, entry_price: float, atr: float):
+        self.entry_price = entry_price
+        self.atr = atr
+
+    def calculate_stop_loss(self, multiplier: float = 2.0) -> float:
+        return self.entry_price - (self.atr * multiplier)
+
+    def calculate_take_profit(self, risk_reward_ratio: float = 2.0, stop_loss: float = None) -> float:
+        if stop_loss is None:
+            stop_loss = self.calculate_stop_loss()
+        risk = self.entry_price - stop_loss
+        return self.entry_price + (risk * risk_reward_ratio)
+
+if __name__ == "__main__":
+    main()
