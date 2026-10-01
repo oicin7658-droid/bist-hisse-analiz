@@ -467,8 +467,8 @@ class BreakoutAnalysisEngine:
             "breakout_score": score,
             "breakout_type": breakout_type,
             "volume_spike": volume_spike,
-            "volume_ratio": round(volume_ratio, 2),
-            "broken_resistances": [round(x, 2) for x in broken_resistances],
+            "volume_ratio": round(float(volume_ratio), 2),
+            "broken_resistances": [round(float(x), 2) for x in broken_resistances],
             "bollinger_breakout": is_bb_breakout,
             "golden_cross": golden_cross,
             "current_rsi": float(last_row['rsi']),
@@ -476,8 +476,8 @@ class BreakoutAnalysisEngine:
             "stoch_k": float(last_row['stoch_k']),
             "stoch_d": float(last_row['stoch_d']),
             "atr_value": float(last_row['atr']) if not pd.isna(last_row['atr']) else 0.0,
-            "near_supports": [round(s, 2) for s in supports if abs(s - current_price) / current_price < 0.03],
-            "near_resistances": [round(r, 2) for r in resistances if abs(r - current_price) / current_price < 0.03]
+            "near_supports": [round(float(s), 2) for s in supports if abs(s - current_price) / current_price < 0.03],
+            "near_resistances": [round(float(r), 2) for r in resistances if abs(r - current_price) / current_price < 0.03]
         }
 
 # ==============================================================================
@@ -488,8 +488,8 @@ class RiskManagementEngine:
     ATR tabanlı Stop-Loss, Take-Profit ve Risk/Ödül oranı hesaplama sınıfı.
     """
     def __init__(self, entry_price: float, atr: float):
-        self.entry_price = entry_price
-        self.atr = atr if atr > 0 else entry_price * 0.02
+        self.entry_price = float(entry_price)
+        self.atr = float(atr) if atr > 0 else float(entry_price) * 0.02
 
     def calculate_trade_setup(self, risk_reward_ratio: float = 2.0, atr_multiplier: float = 1.5) -> dict:
         stop_loss = self.entry_price - (self.atr * atr_multiplier)
@@ -572,6 +572,23 @@ class MarketReportGenerator:
 # ==============================================================================
 # OTOMATİK VERİ DEPOLAMA VE YEDEKLEME MODÜLÜ
 # ==============================================================================
+class NumpyJsonEncoder(json.JSONEncoder):
+    """
+    NumPy veri tiplerini (np.bool_, np.float64, np.int64 vb.) 
+    standart Python nesnelerine dönüştüren özel JSON kodlayıcı.
+    """
+    def default(self, obj):
+        if isinstance(obj, (np.bool_, bool)):
+            return bool(obj)
+        if isinstance(obj, (np.integer, int)):
+            return int(obj)
+        if isinstance(obj, (np.floating, float)):
+            return float(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return super().default(obj)
+
+
 class AnalysisDataExporter:
     """
     Analiz sonuçlarını JSON veya CSV dosyası olarak dışa aktaran sistem.
@@ -580,7 +597,7 @@ class AnalysisDataExporter:
     def export_to_json(data: dict, filename: str = "breakout_report.json"):
         try:
             with open(filename, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=4)
+                json.dump(data, f, cls=NumpyJsonEncoder, ensure_ascii=False, indent=4)
             logger.info(f"Rapor başarıyla {filename} dosyasına aktarıldı.")
         except Exception as e:
             logger.error(f"JSON dışa aktarma hatası: {str(e)}")
