@@ -563,4 +563,4 @@ with tab_risk:
 
                 st.success(f"📌 **Önerilen İşlem Adedi:** `{onerilen_adet}` Adet")
                 st.warning(f"💼 **Gerekli Toplam Pozisyon Büyüklüğü:** `{round(toplam_tutar, 2)}` {para_birimi}")
-                st.error(f"🛑 **Maksimum Göze Alınan Kayıp:** `{round(riske_edilen_para, 2)}` {para_bi
+                st.error(f"🛑 **Maksimum Göze Alınan Kayıp:** `{round(riske_edilen_para, 2)}` {para_birimi}")
