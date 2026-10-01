@@ -16,7 +16,7 @@ warnings.filterwarnings("ignore")
 # ==============================================================================
 # 1. SABİTLER VE LİSTELER
 # ==============================================================================
-# Credentials are read from Streamlit secrets or environment variables.
+# Telegram credentials are loaded from Streamlit secrets or environment variables.
 def get_secret(name, env_name):
     try:
         return st.secrets.get(name, os.getenv(env_name, ""))
@@ -26,10 +26,6 @@ def get_secret(name, env_name):
 
 DEFAULT_TELEGRAM_TOKEN = get_secret("TELEGRAM_BOT_TOKEN", "TELEGRAM_BOT_TOKEN")
 DEFAULT_TELEGRAM_CHAT_ID = get_secret("TELEGRAM_CHAT_ID", "TELEGRAM_CHAT_ID")
-
-BIST_KATILIM_CSV_URL = "https://borsaistanbul.com/datum/hisse_endeks_katilim_ds.csv"
-BIST_KATILIM_PAGE_URL = "https://www.borsaistanbul.com/katilim-esasli-paylar-ve-pay-endeksleri"
-KAP_COMPANY_URL = "https://www.kap.org.tr/tr/bist-sirketler"
 
 BIST_30 = [
     "AKBNK", "ALARK", "ASELS", "BIMAS", "BRSAN", "DOAS", "EKGYO", "ENKAI", 
@@ -181,7 +177,7 @@ def calculate_indicators(df):
     mf_volume = mf_multiplier * df["Volume"]
     df["CMF"] = mf_volume.rolling(20).sum() / (df["Volume"].rolling(20).sum() + 1e-9)
 
-    # Önceki 20 seansın tepe/dip seviyeleri: bugünkü bar hesaplamaya dahil edilmez.
+    # Kırılım seviyeleri: güncel mum, önceki 20 seansın seviyelerine dahil değildir.
     df["Breakout_Resistance_20"] = df["High"].rolling(20).max().shift(1)
     df["Breakout_Support_20"] = df["Low"].rolling(20).min().shift(1)
     df["Volume_Avg_20"] = df["Volume"].rolling(20).mean()
@@ -192,85 +188,45 @@ def calculate_indicators(df):
     return df
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def get_bist_katilim_listesi():
-    """Borsa İstanbul'un yayımladığı güncel Katılım Tüm CSV listesini okur."""
-    from io import BytesIO
-    try:
-        response = requests.get(BIST_KATILIM_CSV_URL, timeout=15)
-        response.raise_for_status()
-        frame = None
-        last_error = None
-        for encoding in ("utf-8-sig", "cp1254", "latin1"):
-            try:
-                frame = pd.read_csv(BytesIO(response.content), sep=None, engine="python", encoding=encoding)
-                break
-            except Exception as exc:
-                last_error = exc
-        if frame is None or frame.empty:
-            return None, str(last_error or "Borsa İstanbul CSV biçimi tanınamadı.")
-        ticker_cols = [col for col in frame.columns if any(key in str(col).casefold() for key in ("kod", "sembol", "symbol", "ticker", "hisse"))]
-        if not ticker_cols:
-            return None, f"CSV içinde sembol sütunu bulunamadı. Sütunlar: {list(frame.columns)}"
-        symbols = set()
-        for col in ticker_cols:
-            for value in frame[col].astype(str).str.upper().str.strip():
-                value = value.replace(".IS", "")
-                if value.isalnum() and 3 <= len(value) <= 6:
-                    symbols.add(value)
-        return (symbols, None) if symbols else (None, "Resmi CSV'den hisse kodu okunamadı.")
-    except Exception as exc:
-        return None, str(exc)
-
-
-def participation_status(symbol):
-    """Resmi güncel kapsam bilgisini gösterir; listede yokluğu uygunsuzluk saymaz."""
-    symbols, error = get_bist_katilim_listesi()
-    clean_symbol = symbol.upper().replace(".IS", "").strip()
-    if symbols is None:
-        return {
-            "status": "Doğrulanamadı",
-            "detail": f"Borsa İstanbul listesi alınamadı: {error}",
-            "source": BIST_KATILIM_PAGE_URL,
-        }
-    if clean_symbol in symbols:
-        return {
-            "status": "Güncel BIST Katılım Tüm listesinde",
-            "detail": "Resmi listede yer alıyor. Daha geniş endeks uygunluğu bu bilgiden ayrıca çıkarılamaz.",
-            "source": BIST_KATILIM_PAGE_URL,
-        }
-    return {
-        "status": "Güncel listede bulunamadı; uygunluk teyidi gerekli",
-        "detail": "Bu sonuç tek başına katılım ilkelerine aykırılık anlamına gelmez. KAP'taki güncel KAFİF formu ve dönemsel BIST duyurusu kontrol edilmelidir.",
-        "source": KAP_COMPANY_URL,
-    }
-
-
 def analyze_breakout_levels(df):
-    """Önemli yatay kırılım seviyelerini ve hacim teyidini özetler."""
+    """Kırılımı trend, momentum ve hacim doğrulamalarıyla sınıflandırır."""
     last = df.iloc[-1]
     close = float(last["Close"])
     resistance = last.get("Breakout_Resistance_20", np.nan)
     support = last.get("Breakout_Support_20", np.nan)
-    volume_ratio = last.get("Volume_Ratio_20", np.nan)
     atr = float(last.get("ATR", np.nan))
+    volume_ratio = float(last.get("Volume_Ratio_20", 0.0)) if pd.notna(last.get("Volume_Ratio_20", np.nan)) else 0.0
     if pd.isna(resistance) or pd.isna(support):
         return {"status": "Yetersiz veri", "resistance": None, "support": None,
-                "volume_ratio": None, "atr": atr}
+                "volume_ratio": None, "confirmations": 0, "checks": {}}
+
     resistance, support = float(resistance), float(support)
-    volume_ratio = float(volume_ratio) if pd.notna(volume_ratio) else 0.0
-    if close > resistance:
-        status = "Yukarı kırılım" + (" (hacim teyitli)" if volume_ratio >= 1.5 else " (hacim teyidi zayıf)")
+    checks = {
+        "20 seans direnci üzerinde kapanış": close > resistance,
+        "Hacim en az 1,5 kat": volume_ratio >= 1.5,
+        "EMA 9, EMA 21 üzerinde": float(last["EMA_9"]) > float(last["EMA_21"]),
+        "Fiyat 200 günlük ortalama üzerinde": close > float(last["SMA_200"]),
+        "MACD sinyal üzerinde ve pozitif": float(last["MACD"]) > float(last["MACD_Signal"]) and float(last["MACD"]) > 0,
+        "RSI 50-70 bandında": 50 <= float(last["RSI"]) <= 70,
+        "CMF pozitif": float(last["CMF"]) > 0,
+    }
+    passed = sum(checks.values())
+    if all(checks.values()):
+        status = "GÜÇLÜ YÜKSELİŞ TEYİDİ (7/7)"
+    elif checks["20 seans direnci üzerinde kapanış"] and checks["Hacim en az 1,5 kat"] and passed >= 5:
+        status = f"YÜKSELİŞ TEYİDİ ( {passed}/7 )"
+    elif close > resistance:
+        status = f"KIRILIM VAR, TEYİT EKSİK ({passed}/7)"
     elif close < support:
-        status = "Aşağı kırılım" + (" (hacim teyitli)" if volume_ratio >= 1.5 else " (hacim teyidi zayıf)")
+        status = "AŞAĞI KIRILIM"
     elif close >= resistance - 0.5 * atr:
-        status = "Direnç bölgesine yakın"
+        status = "DİRENÇ BÖLGESİNE YAKIN"
     elif close <= support + 0.5 * atr:
-        status = "Destek bölgesine yakın"
+        status = "DESTEK BÖLGESİNE YAKIN"
     else:
-        status = "20 seanslık bant içinde"
+        status = "20 SEANSLIK BANT İÇİNDE"
     return {"status": status, "resistance": resistance, "support": support,
-            "volume_ratio": volume_ratio, "atr": atr}
+            "volume_ratio": volume_ratio, "confirmations": passed, "checks": checks}
 
 # ==============================================================================
 # 6. GELİŞMİŞ PLOTLY GÖRSELLEŞTİRME HARİTASI
@@ -421,14 +377,14 @@ def analiz_hesapla(symbol_input, model_tercihi="XGBoost", is_bist=True, sermaye_
         trend_durumu = "YATAY / KARARSIZ"
 
     # Net Sinyal Üretimi
-    if prediction == 1 and prob[1] > 0.62 and trend_durumu == "GÜÇLÜ YÜKSELİŞ (BOĞA)":
-        net_sinyal = "🚀 GÜÇLÜ AL"
-    elif prediction == 1 and prob[1] > 0.52:
-        net_sinyal = "📈 AL (TEDBİRLİ)"
+    if prediction == 1 and prob[1] >= 0.62 and trend_durumu == "GÜÇLÜ YÜKSELİŞ (BOĞA)" and kirilim["confirmations"] == 7:
+        net_sinyal = "🚀 GÜÇLÜ AL (7/7 TEYİTLİ)"
+    elif prediction == 1 and prob[1] >= 0.55 and kirilim["confirmations"] >= 5 and kirilim["checks"].get("20 seans direnci üzerinde kapanış", False) and kirilim["checks"].get("Hacim en az 1,5 kat", False):
+        net_sinyal = f"📈 AL (TEYİTLİ {kirilim['confirmations']}/7)"
     elif prediction == 0 and prob[0] > 0.62:
         net_sinyal = "🛑 GÜÇLÜ SAT / BEKLE"
     else:
-        net_sinyal = "⏳ NÖTR / BEKLE"
+        net_sinyal = "⏳ TEYİT YOK / BEKLE"
 
     # Fiyat Projeksiyonları
     direction_factor = (prob[1] - 0.5) * 2
@@ -472,6 +428,8 @@ def analiz_hesapla(symbol_input, model_tercihi="XGBoost", is_bist=True, sermaye_
         "20 Seans Direnci": round(kirilim["resistance"], 2) if kirilim["resistance"] is not None else None,
         "20 Seans Desteği": round(kirilim["support"], 2) if kirilim["support"] is not None else None,
         "Hacim Ortalamasına Oran": round(kirilim["volume_ratio"], 2) if kirilim["volume_ratio"] is not None else None,
+        "Yükseliş Teyit Sayısı": kirilim["confirmations"],
+        "Yükseliş Teyitleri": kirilim["checks"],
         "Onerilen Adet": alınabilir_adet,
         "Pozisyon Maliyeti": toplam_pozisyon_degeri
     }
@@ -565,19 +523,18 @@ with tab_analiz:
 
             st.divider()
 
-            # Katılım uygunluğu resmi BIST listesinden kontrol edilir.
-            if is_bist_flag:
-                katilim = participation_status(hisse_kod)
-                st.subheader("☪️ Katılım Endeksi Uygunluk Kontrolü")
-                st.info(f"**Durum:** {katilim['status']}\n\n{katilim['detail']}\n\n[Resmi kaynak]({katilim['source']})")
-                st.caption("Borsa İstanbul seçimi, KAP'taki Katılım Finans İlkeleri Bilgi Formu (KAFİF), TKBB standardı ve dönemsel endeks duyurularına dayanır. Bu ekran yatırım veya dini uygunluk danışmanlığı değildir.")
-
-            st.subheader("📍 Önemli Kırılım Noktaları")
-            kb1, kb2, kb3 = st.columns(3)
-            kb1.metric("20 Seans Direnci", f"{ozet_veri['20 Seans Direnci']} {para_birimi}" if ozet_veri["20 Seans Direnci"] is not None else "—")
-            kb2.metric("20 Seans Desteği", f"{ozet_veri['20 Seans Desteği']} {para_birimi}" if ozet_veri["20 Seans Desteği"] is not None else "—")
-            kb3.metric("Kırılım Durumu", ozet_veri["Kırılım Analizi"], delta=f"Hacim / ortalama: {ozet_veri['Hacim Ortalamasına Oran']}x" if ozet_veri["Hacim Ortalamasına Oran"] is not None else None)
-            st.caption("Kırılım değerlendirmesi, önceki 20 seansın tepe/dip seviyesini ve 20 seanslık ortalama hacmi kullanır. 1,5x üzeri hacim teyit olarak gösterilir; tek başına işlem sinyali değildir.")
+            st.subheader("📍 Önemli Kırılım ve Yükseliş Teyitleri")
+            k1, k2, k3 = st.columns(3)
+            k1.metric("20 Seans Direnci", f"{ozet_veri['20 Seans Direnci']} {para_birimi}" if ozet_veri["20 Seans Direnci"] is not None else "—")
+            k2.metric("20 Seans Desteği", f"{ozet_veri['20 Seans Desteği']} {para_birimi}" if ozet_veri["20 Seans Desteği"] is not None else "—")
+            k3.metric("Kırılım Durumu", ozet_veri["Kırılım Analizi"], delta=f"Hacim/ortalama: {ozet_veri['Hacim Ortalamasına Oran']}x" if ozet_veri["Hacim Ortalamasına Oran"] is not None else None)
+            st.write(f"**Yükseliş teyidi:** {ozet_veri['Yükseliş Teyit Sayısı']}/7 koşul")
+            teyit_sol, teyit_sag = st.columns(2)
+            teyit_listesi = list(ozet_veri["Yükseliş Teyitleri"].items())
+            for idx, (ad, gecti) in enumerate(teyit_listesi):
+                hedef = teyit_sol if idx < 4 else teyit_sag
+                hedef.write(f"{'✅' if gecti else '▫️'} {ad}")
+            st.caption("Teyit koşulları sinyali seçici yapar, ancak fiyat hareketini kesinleştirmez veya getiri garantisi vermez.")
 
             # Telegram Sinyal Butonu
             if st.button("📲 Sinyali Telegram Grubuna İlet"):
@@ -589,8 +546,9 @@ with tab_analiz:
 🧭 *Trend Yönü:* `{ozet_veri['Trend Yönü']}`
 📊 *Backtest Doğruluk:* `%{ozet_veri['Model Başarı Oranı (%)']}`
 📍 *Kırılım:* `{ozet_veri['Kırılım Analizi']}`
-🔺 *20 Seans Direnci:* `{ozet_veri['20 Seans Direnci']}`
-🔻 *20 Seans Desteği:* `{ozet_veri['20 Seans Desteği']}`
+✅ *Yükseliş teyidi:* `{ozet_veri['Yükseliş Teyit Sayısı']}/7`
+🔺 *20 Seans direnci:* `{ozet_veri['20 Seans Direnci']}`
+🔻 *20 Seans desteği:* `{ozet_veri['20 Seans Desteği']}`
 
 🔮 *1 Günlük Hedef:* `{ozet_veri['Tahmin 1 Gun']} {para_birimi}`
 🔮 *1 Haftalık Hedef:* `{ozet_veri['Tahmin 1 Hafta']} {para_birimi}`
@@ -660,7 +618,7 @@ with tab_toplu:
             df_res = pd.DataFrame(tarama_sonuc).sort_values(by="Yükseliş İhtimali (%)", ascending=False)
             sutunlar = [
                 "Hisse", "Sinyal", "Trend Yönü", "Yükseliş İhtimali (%)", 
-                "Model Başarı Oranı (%)", "Sinyal Hassasiyeti (%)", "Son Fiyat", 
+                "Model Başarı Oranı (%)", "Sinyal Hassasiyeti (%)", "Yükseliş Teyit Sayısı", "Kırılım Analizi", "Son Fiyat", 
                 "Tahmin 1 Gun", "Kar Al (Take Profit)", "Stop-Loss"
             ]
             st.dataframe(df_res[sutunlar], use_container_width=True)
@@ -698,4 +656,4 @@ with tab_risk:
                 st.warning(f"💼 **Gerekli Toplam Pozisyon Büyüklüğü:** `{round(toplam_tutar, 2)}` {para_birimi}")
                 st.error(f"🛑 **Maksimum Göze Alınan Kayıp:** `{round(riske_edilen_para, 2)}` {para_birimi}")
         else:
-            st.error("Risk hesabı için analiz verisi alınamadı.")
+            st.error(f"Hata: {r_ozet}")
