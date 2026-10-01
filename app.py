@@ -6,7 +6,6 @@ from plotly.subplots import make_subplots
 import requests
 from sklearn.ensemble import RandomForestClassifier
 import streamlit as st
-import streamlit.components.v1 as components
 import yfinance as yf
 from xgboost import XGBClassifier
 
@@ -31,7 +30,7 @@ if "watchlist" not in st.session_state:
 # --- BAŞLIK ---
 st.title("⚡ PRO Hisse Analiz & Canlı Takip Platformu")
 st.caption(
-    "Yapay Zeka Sinyalleri | TradingView Canlı Grafikleri | Telegram Entegre Sistem"
+    "Yapay Zeka Sinyalleri | İnteraktif Plotly Grafikleri | Telegram Entegre Sistem"
 )
 st.divider()
 
@@ -56,34 +55,111 @@ def send_telegram_message(bot_token, chat_id, message):
         return False, str(e)
 
 
-# --- TRADINGVIEW HTML WIDGET FONKSİYONU ---
-def render_tradingview_widget(symbol_code, is_bist=True):
-    tv_symbol = f"BIST:{symbol_code}" if is_bist else symbol_code
+# --- ÖZEL INTERAKTİF PLOTLY GRAFİK FONKSİYONU ---
+def render_custom_plotly_chart(df, symbol_name):
+    """TradingView yerine geçen Candlestick, Bollinger, SMA200 ve MACD Plotly Grafiği."""
+    fig = make_subplots(
+        rows=2,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.03,
+        subplot_titles=(f"{symbol_name} Fiyat & İndikatörler", "MACD"),
+        row_width=[0.25, 0.75],
+    )
 
-    html_code = f"""
-    <div class="tradingview-widget-container" style="height:100%;width:100%">
-      <div id="tradingview_chart" style="height:550px;width:100%"></div>
-      <script type="text/javascript" src="https://s3.tradingview.com/tv.js"></script>
-      <script type="text/javascript">
-      new TradingView.widget(
-      {{
-        "autosize": true,
-        "symbol": "{tv_symbol}",
-        "interval": "D",
-        "timezone": "Europe/Istanbul",
-        "theme": "dark",
-        "style": "1",
-        "locale": "tr",
-        "toolbar_bg": "#f1f3f6",
-        "enable_publishing": false,
-        "allow_symbol_change": true,
-        "container_id": "tradingview_chart"
-      }}
-      );
-      </script>
-    </div>
-    """
-    components.html(html_code, height=560)
+    # Mum Grafiği (Candlestick)
+    fig.add_trace(
+        go.Candlestick(
+            x=df.index,
+            open=df["Open"],
+            high=df["High"],
+            low=df["Low"],
+            close=df["Close"],
+            name="Fiyat",
+        ),
+        row=1,
+        col=1,
+    )
+
+    # 200 SMA
+    if "SMA_200" in df.columns:
+        fig.add_trace(
+            go.Scatter(
+                x=df.index,
+                y=df["SMA_200"],
+                line=dict(color="orange", width=1.5),
+                name="200 SMA",
+            ),
+            row=1,
+            col=1,
+        )
+
+    # Bollinger Bantları
+    if "Upper_Band" in df.columns and "Lower_Band" in df.columns:
+        fig.add_trace(
+            go.Scatter(
+                x=df.index,
+                y=df["Upper_Band"],
+                line=dict(color="gray", width=1, dash="dash"),
+                name="Üst Bollinger",
+            ),
+            row=1,
+            col=1,
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=df.index,
+                y=df["Lower_Band"],
+                line=dict(color="gray", width=1, dash="dash"),
+                name="Alt Bollinger",
+            ),
+            row=1,
+            col=1,
+        )
+
+    # MACD & Histogram
+    if "MACD" in df.columns and "MACD_Signal" in df.columns:
+        fig.add_trace(
+            go.Scatter(
+                x=df.index,
+                y=df["MACD"],
+                line=dict(color="blue", width=1.5),
+                name="MACD",
+            ),
+            row=2,
+            col=1,
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=df.index,
+                y=df["MACD_Signal"],
+                line=dict(color="red", width=1.5),
+                name="Sinyal",
+            ),
+            row=2,
+            col=1,
+        )
+        colors = [
+            "green" if val >= 0 else "red" for val in df["MACD_Hist"].fillna(0)
+        ]
+        fig.add_trace(
+            go.Bar(
+                x=df.index,
+                y=df["MACD_Hist"],
+                marker_color=colors,
+                name="Histogram",
+            ),
+            row=2,
+            col=1,
+        )
+
+    fig.update_layout(
+        xaxis_rangeslider_visible=False,
+        template="plotly_dark",
+        height=600,
+        margin=dict(l=20, r=20, t=40, b=20),
+    )
+    st.plotly_chart(fig, use_container_width=True)
 
 
 # --- TEKNİK ANALİZ VE YAPAY ZEKA FONKSİYONU ---
@@ -102,9 +178,10 @@ def analiz_hesapla(
 
     try:
         df = yf.download(symbol, start=start_date, progress=False)
-        if df.empty or len(df) < 200:
+        if df is None or df.empty or len(df) < 200:
             return None, "Yetersiz veri veya geçersiz hisse kodu."
 
+        # yfinance MultiIndex sütunlarını düzleştirme
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
 
@@ -225,6 +302,24 @@ def analiz_hesapla(
             else "NÖTR / BEKLE"
         )
 
+        # 1 Günlük & 1 Haftalık Fiyat Tahminleri
+        up_prob = float(prob[1])
+        direction_factor = (up_prob - 0.5) * 2
+
+        est_1d = latest_close + (direction_factor * latest_atr * 0.7)
+        est_1w = latest_close + (direction_factor * latest_atr * 2.2)
+
+        # Kırılım Noktası Yorumları
+        kirilim_ust = round(resistance_1, 2)
+        kirilim_alt = round(support_1, 2)
+
+        yapan_analiz_metni = (
+            f"📈 **Yukarı Kırılım:** Fiyat `{kirilim_ust}` üzerinde kalıcılık sağlarsa "
+            f"yeni bir ivme ile `{round(kirilim_ust + latest_atr, 2)}` hedeflenebilir.\n\n"
+            f"📉 **Aşağı Kırılım:** Fiyat `{kirilim_alt}` desteğini aşağı kırarsa "
+            f"`{round(kirilim_alt - latest_atr, 2)}` seviyelerine çekilme riski oluşur."
+        )
+
         ozet = {
             "Hisse": symbol_input.replace(".IS", ""),
             "Model": model_tercihi,
@@ -238,6 +333,9 @@ def analiz_hesapla(
             "Yükseliş İhtimali (%)": round(prob[1] * 100, 1),
             "RSI": round(float(df_cleaned["RSI"].iloc[-1]), 1),
             "StochRSI": round(latest_stoch, 2),
+            "Tahmin 1 Gun": round(est_1d, 2),
+            "Tahmin 1 Hafta": round(est_1w, 2),
+            "Kirilim Analizi": yapan_analiz_metni,
         }
 
         return df_cleaned, ozet
@@ -287,10 +385,9 @@ if st.sidebar.button("🔔 Test Mesajı Gönder"):
         st.sidebar.error(f"Mesaj gönderilemedi: {msg}")
 
 # --- SEKMELER ---
-tab_analiz, tab_watchlist, tab_toplu = st.tabs(
+tab_analiz, tab_toplu = st.tabs(
     [
-        "🔍 Tekil Hisse & Canlı Grafik",
-        "⭐ Takip Listem Canlı Özet",
+        "🔍 Tekil Hisse & İnteraktif Grafik",
         "📊 Toplu BIST Taraması",
     ]
 )
@@ -338,6 +435,20 @@ with tab_analiz:
             )
             c5.metric("Model Sinyali", ozet_veri["Sinyal"])
 
+            # Gelecek Tahminleri
+            st.markdown("### 🎯 Yapay Zeka Tahmini Beklentiler")
+            col_t1, col_t2 = st.columns(2)
+            col_t1.info(
+                f"**1 Gün Sonra Beklenen Fiyat:** `{ozet_veri['Tahmin 1 Gun']} {para_birimi}`"
+            )
+            col_t2.success(
+                f"**1 Hafta Sonra Beklenen Fiyat:** `{ozet_veri['Tahmin 1 Hafta']} {para_birimi}`"
+            )
+
+            # Kırılım Noktaları
+            st.markdown("### ⚡ Kritik Kırılım Noktaları ve Senaryolar")
+            st.write(ozet_veri["Kirilim Analizi"])
+
             # Telegram Sinyal Butonu
             if st.button("📲 Bu Analizi Telegram'a Gönder"):
                 mesaj = f"""
@@ -347,9 +458,15 @@ with tab_analiz:
 🚥 *Sinyal:* *{ozet_veri['Sinyal']}*
 📊 *Yükseliş İhtimali:* `%{ozet_veri['Yükseliş İhtimali (%)']}`
 
+🔮 *1 Günlük Tahmin:* `{ozet_veri['Tahmin 1 Gun']} {para_birimi}`
+🔮 *1 Haftalık Tahmin:* `{ozet_veri['Tahmin 1 Hafta']} {para_birimi}`
+
 🎯 *İdeal Alış:* `{ozet_veri['İdeal Alış']} {para_birimi}`
 🛑 *Stop-Loss:* `{ozet_veri['Stop-Loss']} {para_birimi}`
 🛡️ *Destek:* `{ozet_veri['Destek S1']}` | *Direnç:* `{ozet_veri['Direnç R1']}`
+
+📌 *Kırılım Analizi:*
+{ozet_veri['Kirilim Analizi']}
                 """
                 ok, res = send_telegram_message(
                     telegram_token, telegram_chat_id, mesaj
@@ -360,10 +477,12 @@ with tab_analiz:
                     st.error(f"Gönderilemedi: {res}")
 
             st.divider()
-            render_tradingview_widget(hisse_kod, is_bist=is_bist_flag)
+
+            # Özel Plotly Grafiği
+            render_custom_plotly_chart(df_data, ozet_veri["Hisse"])
 
 # ==============================================================================
-# SEKME 3: TOPLU TARAMA VE OTOMATİK TELEGRAM BİLDİRİMİ
+# SEKME 2: TOPLU TARAMA VE OTOMATİK TELEGRAM BİLDİRİMİ
 # ==============================================================================
 with tab_toplu:
     st.subheader("📊 Toplu Hisse Taraması & Otomatik Sinyal Gönderimi")
@@ -396,7 +515,12 @@ with tab_toplu:
 
                 # Otomatik Telegram Bildirimi
                 if auto_telegram and oz["Sinyal"] == "GÜÇLÜ AL":
-                    msg = f"⚡ *GÜÇLÜ AL SİNYALİ:* `{oz['Hisse']}`\n💵 Fiyat: `{oz['Son Fiyat']}` | 🎯 İdeal Alış: `{oz['İdeal Alış']}`\n📊 Yükseliş İhtimali: `%{oz['Yükseliş İhtimali (%)']}`"
+                    msg = (
+                        f"⚡ *GÜÇLÜ AL SİNYALİ:* `{oz['Hisse']}`\n"
+                        f"💵 Fiyat: `{oz['Son Fiyat']}` | 🎯 İdeal Alış: `{oz['İdeal Alış']}`\n"
+                        f"🔮 1 Günlük Tahmin: `{oz['Tahmin 1 Gun']}` | 1 Haftalık Tahmin: `{oz['Tahmin 1 Hafta']}`\n"
+                        f"📊 Yükseliş İhtimali: `%{oz['Yükseliş İhtimali (%)']}`"
+                    )
                     send_telegram_message(
                         telegram_token, telegram_chat_id, msg
                     )
