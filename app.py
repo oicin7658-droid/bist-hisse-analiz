@@ -90,8 +90,8 @@ class RobustHTTPClient:
                 response = self.session.get(url, timeout=self.timeout)
                 if response.status_code == 200:
                     return response.json()
-                elif response.status_code == 401:
-                    logger.warning(f"401 Yetkilendirme hatası alındı. Oturum çerezleri yenileniyor... (Deneme {attempt + 1})")
+                elif response.status_code in (401, 403):
+                    logger.warning(f"401/403 Yetkilendirme uyarısı alındı. Oturum yenileniyor... (Deneme {attempt + 1})")
                     self.session.get("https://finance.yahoo.com", timeout=self.timeout)
                 else:
                     logger.warning(f"HTTP İstek Hatası ({response.status_code}): {url}")
@@ -101,7 +101,7 @@ class RobustHTTPClient:
         return {}
 
 # ==============================================================================
-# CANLI HİSSE VERİ ÇEKİCİ (TRADINGVIEW HARİÇ ALTERNATİF KAYNAKLAR)
+# CANLI HİSSE VERİ ÇEKİCİ (FALLBACK KORUMALI)
 # ==============================================================================
 class LiveMarketDataFetcher:
     """
@@ -155,7 +155,7 @@ class LiveMarketDataFetcher:
                 "change_percent": float(change_percent),
                 "timestamp": datetime.datetime.now().isoformat(),
                 "market_cap": meta.get("marketCap", "N/A"),
-                "currency": meta.get("currency", "USD"),
+                "currency": meta.get("currency", "TRY"),
                 "data_source": "Yahoo_Finance_Direct"
             }
         except Exception as e:
@@ -164,7 +164,7 @@ class LiveMarketDataFetcher:
 
     def _fetch_stooq_fallback(self, symbol: str) -> dict:
         """
-        Yahoo servisleri tamamen kısıtlandığında çalışan alternatif Borsa Veri Yedeği.
+        Yahoo servisleri kısıtlandığında çalışan alternatif Borsa Veri Yedeği.
         """
         logger.info(f"[{symbol}] Stooq alternatif uç noktasından veri isteniyor...")
         clean_symbol = symbol.lower().replace(".is", ".tr")
@@ -200,26 +200,25 @@ class LiveMarketDataFetcher:
 
     def fetch_historical_ohlcv(self, symbol: str, days: int = 365) -> pd.DataFrame:
         """
-        Tarihsel günlük mum (OHLCV) verisini yfinance SDK'sı veya doğrudan HTTP CSV indirmesiyle çeker.
+        Tarihsel günlük mum verisini güvenli şekilde çeker.
+        Hata oluşursa 'No data found' ile patlamak yerine yedek CSV indiricisine geçer.
         """
         logger.info(f"[{symbol}] {days} günlük tarihsel OHLCV verisi indiriliyor...")
         if yf is not None:
             try:
                 end_date = datetime.datetime.now()
                 start_date = end_date - datetime.timedelta(days=days)
-                df = yf.download(
-                    symbol,
-                    start=start_date.strftime('%Y-%m-%d'),
-                    end=end_date.strftime('%Y-%m-%d'),
-                    progress=False
-                )
-                if not df.empty:
+                
+                ticker = yf.Ticker(symbol)
+                df = ticker.history(start=start_date.strftime('%Y-%m-%d'), end=end_date.strftime('%Y-%m-%d'))
+                
+                if df is not None and not df.empty:
                     if isinstance(df.columns, pd.MultiIndex):
                         df.columns = df.columns.get_level_values(0)
                     df.columns = [str(c).lower() for c in df.columns]
                     return df
             except Exception as e:
-                logger.error(f"[{symbol}] yfinance SDK indirme hatası: {str(e)}")
+                logger.warning(f"[{symbol}] yfinance SDK hatası: {str(e)}. Yedeğe geçiliyor...")
 
         return self._download_yahoo_csv_fallback(symbol, days)
 
@@ -230,7 +229,7 @@ class LiveMarketDataFetcher:
         
         try:
             res = self.http_client.session.get(url, timeout=15)
-            if res.status_code == 200:
+            if res.status_code == 200 and "Date" in res.text:
                 from io import StringIO
                 df = pd.read_csv(StringIO(res.text))
                 df.columns = [str(c).lower() for c in df.columns]
@@ -413,6 +412,7 @@ class BreakoutAnalysisEngine:
     def analyze_breakout_signals(self) -> dict:
         """
         Direnç Kırılımı, Hacim Patlaması, Bollinger Sıkışması ve Indikatör Uyumunu Analiz Eder.
+        Sözlük verilerindeki tüm NumPy tipleri `bool()`, `float()`, `int()` olarak dönüştürülmüştür.
         """
         if len(self.df) < 50:
             return {"breakout_detected": False, "reason": "Yetersiz zaman serisi verisi."}
@@ -509,8 +509,7 @@ class RiskManagementEngine:
 # ==============================================================================
 class MarketReportGenerator:
     """
-    Analiz sonuçlarını, canlı verileri ve teknik ölçümleri kullanıcı için konsol veya
-    formatlı rapor haline getiren yardımcı sınıf.
+    Analiz sonuçlarını, canlı verileri ve teknik ölçümleri konsola formatlı basar.
     """
     @staticmethod
     def generate_full_report(symbol: str, live_data: dict, breakout_info: dict, fib_levels: dict, risk_setup: dict):
@@ -518,7 +517,7 @@ class MarketReportGenerator:
         print(f"                CANLI HİSSE VE KIRILIM ANALİZ RAPORU: {symbol}")
         print("=" * 85)
         print(f"Rapor Tarihi/Saat   : {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"Veri Kaynağı        : {live_data.get('data_source', 'TradingView Harici Alternatif API')}")
+        print(f"Veri Kaynağı        : {live_data.get('data_source', 'Alternatif HTTP Engine')}")
         print("-" * 85)
         
         print("1. CANLI PİYASA VERİLERİ (REAL-TIME METRICS)")
@@ -526,7 +525,7 @@ class MarketReportGenerator:
             curr = live_data.get('current_price', 0)
             chg = live_data.get('change', 0)
             pct = live_data.get('change_percent', 0)
-            unit = live_data.get('currency', 'USD')
+            unit = live_data.get('currency', 'TRY')
             print(f"   - Anlık Fiyat    : {curr:.2f} {unit}")
             print(f"   - Günlük Değişim : %{pct:.2f} ({chg:+.2f})")
             print(f"   - Günlük Yüksek  : {live_data.get('high', 0):.2f}")
@@ -591,7 +590,7 @@ class NumpyJsonEncoder(json.JSONEncoder):
 
 class AnalysisDataExporter:
     """
-    Analiz sonuçlarını JSON veya CSV dosyası olarak dışa aktaran sistem.
+    Analiz sonuçlarını JSON dosyası olarak dışa aktaran sistem.
     """
     @staticmethod
     def export_to_json(data: dict, filename: str = "breakout_report.json"):
@@ -608,7 +607,7 @@ class AnalysisDataExporter:
 def main():
     logger.info("Gelişmiş Canlı Hisse Kırılım Analiz Sistemi Başlatılıyor...")
     
-    target_symbols = ["THYAO.IS", "GARAN.IS", "AAPL", "MSFT", "NVDA", "TSLA"]
+    target_symbols = ["KOZAL.IS", "THYAO.IS", "GARAN.IS", "AAPL", "MSFT", "NVDA", "TSLA"]
     
     fetcher = LiveMarketDataFetcher()
     all_reports = {}
