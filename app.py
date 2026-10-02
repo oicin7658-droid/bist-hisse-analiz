@@ -206,6 +206,322 @@ def calculate_indicators(df):
     return df
 
 
+
+
+def normalize_symbol_list(raw_text):
+    """Virgul, bosluk ve satir sonu ile ayrilmis sembolleri tekilleştirir."""
+    if not raw_text:
+        return []
+    normalized=[]
+    seen=set()
+    for token in str(raw_text).replace("\n", ",").replace(";", ",").split(","):
+        symbol=token.strip().upper()
+        if not symbol:
+            continue
+        symbol=symbol.replace(".IS", "")
+        if symbol not in seen:
+            normalized.append(symbol)
+            seen.add(symbol)
+    return normalized
+
+
+def validate_market_data(df):
+    """OHLCV girdisini analizden once denetler ve sorunlari raporlar."""
+    required=["Open", "High", "Low", "Close", "Volume"]
+    missing=[column for column in required if column not in df.columns]
+    if missing:
+        return False, ["Eksik alanlar: " + ", ".join(missing)]
+    problems=[]
+    if df.empty:
+        return False, ["Veri tablosu bos."]
+    if not df.index.is_monotonic_increasing:
+        problems.append("Tarih sirasi duzeltildi.")
+    if df.index.has_duplicates:
+        problems.append("Tekrarlanan tarihler temizlendi.")
+    numeric=df[required].apply(pd.to_numeric, errors="coerce")
+    if numeric["Close"].isna().any():
+        problems.append("Gecersiz kapanis fiyatlari bulundu.")
+    if (numeric[["Open", "High", "Low", "Close"]] <= 0).any().any():
+        problems.append("Sifir veya negatif fiyat kayitlari bulundu.")
+    if (numeric["Volume"] < 0).any():
+        problems.append("Negatif hacim degerleri bulundu.")
+    return True, problems
+
+
+def clean_market_data(df):
+    """Veriyi siralar, tekrarli satirlari kaldirir ve OHLCV'yi sayisala cevirir."""
+    if df is None:
+        return None
+    result=df.copy()
+    result=result[~result.index.duplicated(keep="last")]
+    result=result.sort_index()
+    for column in ["Open", "High", "Low", "Close", "Volume"]:
+        if column in result.columns:
+            result[column]=pd.to_numeric(result[column], errors="coerce")
+    result=result.dropna(subset=["Open", "High", "Low", "Close"])
+    result["Volume"]=result["Volume"].fillna(0).clip(lower=0)
+    return result
+
+
+def market_regime_snapshot(row):
+    """Son mum icin trend, volatilite ve hacim rejimini ozetler."""
+    close=float(row.get("Close", np.nan))
+    atr_pct=float(row.get("ATR_PCT", np.nan))
+    adx=float(row.get("ADX", np.nan))
+    rsi=float(row.get("RSI", np.nan))
+    volume_ratio=float(row.get("Volume_Ratio_20", np.nan))
+    if pd.notna(close) and close > float(row.get("SMA_200", np.nan)):
+        trend="Uzun vadeli yukselis"
+    elif pd.notna(close) and close < float(row.get("SMA_200", np.nan)):
+        trend="Uzun vadeli dusus"
+    else:
+        trend="Uzun vadeli yon belirsiz"
+    if pd.isna(adx):
+        momentum="ADX icin veri yetersiz"
+    elif adx >= 25:
+        momentum="Belirgin trend"
+    else:
+        momentum="Zayif veya yatay trend"
+    if pd.isna(atr_pct):
+        volatility="Volatilite verisi yetersiz"
+    elif atr_pct >= 0.05:
+        volatility="Yuksek volatilite"
+    elif atr_pct <= 0.015:
+        volatility="Dusuk volatilite"
+    else:
+        volatility="Orta volatilite"
+    if pd.isna(rsi):
+        momentum += "; RSI verisi yetersiz"
+    elif rsi >= 70:
+        momentum += "; RSI asiri alima yakin"
+    elif rsi <= 30:
+        momentum += "; RSI asiri satima yakin"
+    if pd.notna(volume_ratio) and volume_ratio >= 1.5:
+        volume_state="Hacim canli"
+    else:
+        volume_state="Hacim normal veya dusuk"
+    return {"Trend Rejimi":trend, "Momentum Rejimi":momentum, "Volatilite Rejimi":volatility, "Hacim Rejimi":volume_state}
+
+
+def score_bucket_backtest(df, threshold=60, horizons=(5, 10)):
+    """Agirlikli skor esigini kullanan tarihsel sinyallerin yon isabetini hesaplar."""
+    scored=[]
+    for _, row in df.iterrows():
+        scored.append(score_signal_row(row))
+    score_table=pd.DataFrame(scored, index=df.index)
+    close=df["Close"].astype(float)
+    report=[]
+    for horizon in horizons:
+        forward=close.shift(-horizon)/close-1
+        buy_mask=(score_table["buy_score"] >= threshold) & (score_table["buy_score"] > score_table["sell_score"])
+        sell_mask=(score_table["sell_score"] >= threshold) & (score_table["sell_score"] > score_table["buy_score"])
+        for direction, mask, returns in (("AL", buy_mask, forward), ("SAT", sell_mask, -forward)):
+            observed=returns[mask].dropna()
+            report.append({
+                "Vade":horizon,
+                "Yon":direction,
+                "Esik":threshold,
+                "Sinyal":int(observed.size),
+                "Yon Isabeti (%)":round(float((observed>0).mean()*100),1) if len(observed) else None,
+                "Ortalama Hareket (%)":round(float(observed.mean()*100),2) if len(observed) else None,
+                "En Iyi (%)":round(float(observed.max()*100),2) if len(observed) else None,
+                "En Kotu (%)":round(float(observed.min()*100),2) if len(observed) else None,
+            })
+    return pd.DataFrame(report)
+
+
+def make_scan_csv(scan_rows):
+    """Tarama sonuclarini indirilebilir UTF-8 CSV olarak hazirlar."""
+    if not scan_rows:
+        return b""
+    frame=pd.DataFrame(scan_rows)
+    keep=[column for column in ["Hisse", "Sinyal", "Teknik Sinyal", "AL Puanı", "SAT Puanı", "Son Fiyat", "Trend Yönü", "Model Başarı Oranı (%)"] if column in frame.columns]
+    if not keep:
+        keep=list(frame.columns)
+    return frame[keep].to_csv(index=False).encode("utf-8-sig")
+
+
+def add_advanced_indicators(df):
+    """Sinyal puanlamasi icin ek trend, momentum, para akisi ve volatilite olcutleri."""
+    df = df.copy()
+    high = df["High"].astype(float)
+    low = df["Low"].astype(float)
+    close = df["Close"].astype(float)
+    volume = df["Volume"].astype(float).fillna(0)
+
+    # Stochastic oscillator
+    stoch_low = low.rolling(14, min_periods=14).min()
+    stoch_high = high.rolling(14, min_periods=14).max()
+    df["Stoch_K"] = 100 * (close - stoch_low) / (stoch_high - stoch_low + 1e-9)
+    df["Stoch_D"] = df["Stoch_K"].rolling(3, min_periods=3).mean()
+
+    # Directional movement and ADX
+    up_move = high.diff()
+    down_move = -low.diff()
+    plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
+    minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
+    prev_close = close.shift(1)
+    true_range = pd.concat([high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
+    atr14 = true_range.ewm(alpha=1 / 14, min_periods=14, adjust=False).mean()
+    df["DI_Plus"] = 100 * plus_dm.ewm(alpha=1 / 14, min_periods=14, adjust=False).mean() / (atr14 + 1e-9)
+    df["DI_Minus"] = 100 * minus_dm.ewm(alpha=1 / 14, min_periods=14, adjust=False).mean() / (atr14 + 1e-9)
+    dx = 100 * (df["DI_Plus"] - df["DI_Minus"]).abs() / (df["DI_Plus"] + df["DI_Minus"] + 1e-9)
+    df["ADX"] = dx.ewm(alpha=1 / 14, min_periods=14, adjust=False).mean()
+
+    # Money Flow Index
+    typical = (high + low + close) / 3
+    raw_flow = typical * volume
+    positive_flow = raw_flow.where(typical > typical.shift(1), 0.0).rolling(14, min_periods=14).sum()
+    negative_flow = raw_flow.where(typical < typical.shift(1), 0.0).rolling(14, min_periods=14).sum()
+    money_ratio = positive_flow / (negative_flow + 1e-9)
+    df["MFI"] = 100 - 100 / (1 + money_ratio)
+
+    # Rolling VWAP and rate of change
+    df["VWAP_20"] = (typical * volume).rolling(20, min_periods=20).sum() / (volume.rolling(20, min_periods=20).sum() + 1e-9)
+    df["ROC_10"] = close.pct_change(10) * 100
+
+    # Donchian levels exclude the current candle
+    df["Donchian_Upper_20"] = high.rolling(20, min_periods=20).max().shift(1)
+    df["Donchian_Lower_20"] = low.rolling(20, min_periods=20).min().shift(1)
+
+    # Ichimoku conversion/base lines (unshifted values used only as current references)
+    df["Ichimoku_Tenkan"] = (high.rolling(9, min_periods=9).max() + low.rolling(9, min_periods=9).min()) / 2
+    df["Ichimoku_Kijun"] = (high.rolling(26, min_periods=26).max() + low.rolling(26, min_periods=26).min()) / 2
+
+    # Supertrend direction. Bands are updated bar by bar to avoid future data.
+    st_atr = atr14
+    midpoint = (high + low) / 2
+    basic_upper = midpoint + 3.0 * st_atr
+    basic_lower = midpoint - 3.0 * st_atr
+    final_upper = basic_upper.copy()
+    final_lower = basic_lower.copy()
+    trend = pd.Series(index=df.index, dtype=float)
+    direction = pd.Series(index=df.index, dtype=float)
+    for i in range(len(df)):
+        if i == 0 or pd.isna(st_atr.iloc[i]):
+            trend.iloc[i] = np.nan
+            direction.iloc[i] = 0
+            continue
+        prev_upper = final_upper.iloc[i - 1]
+        prev_lower = final_lower.iloc[i - 1]
+        if pd.isna(prev_upper):
+            final_upper.iloc[i] = basic_upper.iloc[i]
+        elif basic_upper.iloc[i] < prev_upper or close.iloc[i - 1] > prev_upper:
+            final_upper.iloc[i] = basic_upper.iloc[i]
+        else:
+            final_upper.iloc[i] = prev_upper
+        if pd.isna(prev_lower):
+            final_lower.iloc[i] = basic_lower.iloc[i]
+        elif basic_lower.iloc[i] > prev_lower or close.iloc[i - 1] < prev_lower:
+            final_lower.iloc[i] = basic_lower.iloc[i]
+        else:
+            final_lower.iloc[i] = prev_lower
+        previous_direction = direction.iloc[i - 1]
+        if previous_direction <= 0 and close.iloc[i] > final_upper.iloc[i]:
+            direction.iloc[i] = 1
+        elif previous_direction >= 0 and close.iloc[i] < final_lower.iloc[i]:
+            direction.iloc[i] = -1
+        else:
+            direction.iloc[i] = previous_direction
+        trend.iloc[i] = final_lower.iloc[i] if direction.iloc[i] > 0 else final_upper.iloc[i]
+    df["Supertrend"] = trend
+    df["Supertrend_Direction"] = direction
+
+    return df
+
+
+def score_signal_row(row):
+    """Tek bir mum icin agirlikli AL/SAT puanini ve gerekceleri dondurur."""
+    buy_score = 0
+    sell_score = 0
+    buy_reasons = []
+    sell_reasons = []
+
+    def value(name, default=np.nan):
+        item = row.get(name, default)
+        try:
+            return float(item) if pd.notna(item) else default
+        except (TypeError, ValueError):
+            return default
+
+    def add(condition, points, side, reason):
+        nonlocal buy_score, sell_score
+        if condition:
+            if side == "buy":
+                buy_score += points
+                buy_reasons.append(f"+{points}: {reason}")
+            else:
+                sell_score += points
+                sell_reasons.append(f"+{points}: {reason}")
+
+    close = value("Close")
+    add(value("EMA_9") > value("EMA_21"), 9, "buy", "EMA 9, EMA 21 uzerinde")
+    add(value("EMA_9") < value("EMA_21"), 9, "sell", "EMA 9, EMA 21 altinda")
+    add(close > value("SMA_200"), 9, "buy", "Fiyat 200 gunluk ortalama uzerinde")
+    add(close < value("SMA_200"), 9, "sell", "Fiyat 200 gunluk ortalama altinda")
+    add(value("MACD") > value("MACD_Signal"), 8, "buy", "MACD sinyal cizgisinin uzerinde")
+    add(value("MACD") < value("MACD_Signal"), 8, "sell", "MACD sinyal cizgisinin altinda")
+    add(50 <= value("RSI", 50) <= 70, 7, "buy", "RSI yukselis bolgesinde")
+    add(value("RSI", 50) < 50, 7, "sell", "RSI 50 altinda")
+    add(value("ADX") >= 20 and value("DI_Plus") > value("DI_Minus"), 8, "buy", "ADX trendi ve DI+ ustunlugu")
+    add(value("ADX") >= 20 and value("DI_Minus") > value("DI_Plus"), 8, "sell", "ADX trendi ve DI- ustunlugu")
+    add(value("CMF") > 0, 6, "buy", "CMF para girisine isaret ediyor")
+    add(value("CMF") < 0, 6, "sell", "CMF para cikisina isaret ediyor")
+    add(value("MFI", 50) > 50, 5, "buy", "MFI alici tarafinda")
+    add(value("MFI", 50) < 50, 5, "sell", "MFI satici tarafinda")
+    add(close > value("VWAP_20"), 7, "buy", "Fiyat 20 gunluk VWAP uzerinde")
+    add(close < value("VWAP_20"), 7, "sell", "Fiyat 20 gunluk VWAP altinda")
+    add(value("Supertrend_Direction") > 0, 8, "buy", "Supertrend yukari yonlu")
+    add(value("Supertrend_Direction") < 0, 8, "sell", "Supertrend asagi yonlu")
+    add(value("Ichimoku_Tenkan") > value("Ichimoku_Kijun"), 5, "buy", "Ichimoku donus cizgisi baz cizginin ustunde")
+    add(value("Ichimoku_Tenkan") < value("Ichimoku_Kijun"), 5, "sell", "Ichimoku donus cizgisi baz cizginin altinda")
+    smart_long = row.get("Smart_Long", False)
+    smart_short = row.get("Smart_Short", False)
+    institutional_sell = row.get("Institutional_Sell", False)
+    smart_long = bool(smart_long) if pd.notna(smart_long) else False
+    smart_short = bool(smart_short) if pd.notna(smart_short) else False
+    institutional_sell = bool(institutional_sell) if pd.notna(institutional_sell) else False
+    add(smart_long, 12, "buy", "Smart Market Structure yukari kirilimi")
+    add(smart_short, 12, "sell", "Smart Market Structure asagi kirilimi")
+    add(institutional_sell, 12, "sell", "Kurumsal alt likidite kirilimi")
+    add(value("Volume_Ratio_20", 0) >= 1.5 and close > value("Close", close), 4, "buy", "Hacim ortalamanin 1.5 kati")
+    add(value("Breakout_Down", 0) == 1, 4, "sell", "Yuksek hacimli 20 seans asagi kirilimi")
+
+    buy_score = min(int(buy_score), 100)
+    sell_score = min(int(sell_score), 100)
+    return {
+        "buy_score": buy_score,
+        "sell_score": sell_score,
+        "buy_reasons": buy_reasons,
+        "sell_reasons": sell_reasons,
+    }
+
+
+def build_signal_backtest(df, horizons=(5, 10)):
+    """Gecmis AL/SAT sinyallerinin sonraki kapanislardaki yon performansini ozetler."""
+    rows = []
+    close = df["Close"].astype(float)
+    for horizon in horizons:
+        future_return = close.shift(-horizon) / close - 1
+        buy_returns = future_return[df["Merged_Long"].fillna(False)].dropna()
+        sell_returns = -future_return[df["Merged_Short"].fillna(False)].dropna()
+        for label, values in (("AL", buy_returns), ("SAT", sell_returns)):
+            rows.append({
+                "Vade (seans)": horizon,
+                "Yon": label,
+                "Sinyal Sayisi": int(len(values)),
+                "Yon Isabeti (%)": round(float((values > 0).mean() * 100), 1) if len(values) else None,
+                "Ortalama Hareket (%)": round(float(values.mean() * 100), 2) if len(values) else None,
+                "Medyan Hareket (%)": round(float(values.median() * 100), 2) if len(values) else None,
+            })
+    return pd.DataFrame(rows)
+
+
+def format_signal_reasons(reasons, empty_text="Bu mumda puan kazandiran kosul yok."):
+    """Sinyal gerekcelerini Streamlit ve Telegram icin okunabilir metne cevirir."""
+    return "\n".join(reasons) if reasons else empty_text
+
+
 def analyze_breakout_levels(df):
     """Kırılımı trend, momentum ve hacim doğrulamalarıyla sınıflandırır."""
     last = df.iloc[-1]
@@ -321,21 +637,31 @@ def render_custom_plotly_chart(df, symbol_name):
 # 7. YAPAY ZEKA MODELLERİ VE TAHMİN MOTORU
 # ==============================================================================
 @st.cache_data(ttl=1800, show_spinner=False)
-def analiz_hesapla(symbol_input, model_tercihi="XGBoost", is_bist=True, sermaye_input=100000):
+def analiz_hesapla(symbol_input, model_tercihi="XGBoost", is_bist=True, sermaye_input=100000, signal_threshold=60):
     df = get_stock_data_hybrid(symbol_input, is_bist=is_bist)
+    df = clean_market_data(df)
     if df is None or len(df) < 150:
         return None, "Canlı veri çekilemedi veya veri hacmi yetersiz."
 
-    # İndikatör İşleme
+    data_is_valid, data_quality_notes = validate_market_data(df)
+    if not data_is_valid:
+        return None, "Piyasa verisi kullanilabilir degil: " + "; ".join(data_quality_notes)
+
+    # Indikator processing
     df_ind = calculate_indicators(df)
+    df_ind = add_advanced_indicators(df_ind)
 
     # Hedef Oluşturma (%0.5 üzeri 1 gün sonrası artış)
     df_ind["Target"] = np.where(df_ind["Close"].shift(-1) > df_ind["Close"] * 1.005, 1, 0)
     df_cleaned = df_ind.replace([np.inf, -np.inf], np.nan).dropna()
+    if len(df_cleaned) < 150:
+        return None, "Indikatorlar sonrasi kullanilabilir gecmis 150 mumdan az."
 
     features = [
-        "Return", "RSI", "Stoch_RSI", "MACD", "MACD_Hist", 
-        "ATR_PCT", "BB_Width", "Williams_R", "CMF"
+        "Return", "RSI", "Stoch_RSI", "MACD", "MACD_Hist",
+        "ATR_PCT", "BB_Width", "Williams_R", "CMF", "Stoch_K",
+        "Stoch_D", "ADX", "DI_Plus", "DI_Minus", "MFI", "ROC_10",
+        "Supertrend_Direction"
     ]
     
     X = df_cleaned[features]
@@ -386,6 +712,17 @@ def analiz_hesapla(symbol_input, model_tercihi="XGBoost", is_bist=True, sermaye_
     latest_atr = float(df_cleaned["ATR"].iloc[-1])
     kirilim = analyze_breakout_levels(df_cleaned)
     merged_signal = "AL" if bool(df_cleaned["Merged_Long"].iloc[-1]) else ("SAT" if bool(df_cleaned["Merged_Short"].iloc[-1]) else "SİNYAL YOK")
+    signal_scores = score_signal_row(df_cleaned.iloc[-1])
+    if signal_scores["buy_score"] >= signal_threshold and signal_scores["buy_score"] > signal_scores["sell_score"]:
+        technical_signal = "GÜÇLÜ AL" if signal_scores["buy_score"] >= 75 else "AL ADAYI"
+    elif signal_scores["sell_score"] >= signal_threshold and signal_scores["sell_score"] > signal_scores["buy_score"]:
+        technical_signal = "GÜÇLÜ SAT" if signal_scores["sell_score"] >= 75 else "SAT ADAYI"
+    else:
+        technical_signal = "BEKLE"
+    signal_history = score_bucket_backtest(df_cleaned, threshold=signal_threshold)
+    hit_5d = signal_history[(signal_history["Vade"] == 5) & signal_history["Yon Isabeti (%)"].notna()]
+    hit_5d_rate = float(hit_5d["Yon Isabeti (%)"].mean()) if not hit_5d.empty else None
+    regime = market_regime_snapshot(df_cleaned.iloc[-1])
 
     # Trend Yönü Kararı
     if latest_close > latest_sma200 and latest_ema9 > latest_ema21:
@@ -431,6 +768,15 @@ def analiz_hesapla(symbol_input, model_tercihi="XGBoost", is_bist=True, sermaye_
         "Günlük Değişim (%)": round(change_pct, 2),
         "Sinyal": net_sinyal,
         "Birleşik Yapı Sinyali": merged_signal,
+        "Teknik Sinyal": technical_signal,
+        "AL Puanı": signal_scores["buy_score"],
+        "SAT Puanı": signal_scores["sell_score"],
+        "AL Gerekçeleri": format_signal_reasons(signal_scores["buy_reasons"]),
+        "SAT Gerekçeleri": format_signal_reasons(signal_scores["sell_reasons"]),
+        "5 Seans Yön İsabeti (%)": round(hit_5d_rate, 1) if hit_5d_rate is not None else None,
+        "Sinyal Performans Özeti": signal_history,
+        "Piyasa Rejimi": regime,
+        "Veri Kalitesi Notları": data_quality_notes,
         "Trend Yönü": trend_durumu,
         "Yükseliş İhtimali (%)": round(prob[1] * 100, 1),
         "Model Başarı Oranı (%)": round(acc_score, 1),
@@ -464,6 +810,7 @@ st.sidebar.header("⚙️ Genel Sistem Ayarları")
 secilen_model = st.sidebar.selectbox("🤖 Algoritma Tipi", ["XGBoost", "Random Forest"])
 piyasa = st.sidebar.radio("Piyasa Seçimi", ["BIST (Türk Borsası)", "ABD Borsaları"])
 sermaye = st.sidebar.number_input("Toplam Portföy Büyüklüğü:", value=100000, step=10000)
+sinyal_esigi = st.sidebar.slider("Teknik Sinyal Minimum Puanı", 40, 85, 60, 5)
 
 if piyasa == "BIST (Türk Borsası)":
     varsayilan_hisse = "ASELS"
@@ -514,7 +861,8 @@ with tab_analiz:
                 hisse_kod, 
                 model_tercihi=secilen_model, 
                 is_bist=is_bist_flag,
-                sermaye_input=sermaye
+                sermaye_input=sermaye,
+                signal_threshold=sinyal_esigi
             )
 
         if df_data is None:
@@ -525,9 +873,30 @@ with tab_analiz:
             c1.metric("Son Fiyat", f"{ozet_veri['Son Fiyat']} {para_birimi}", delta=f"%{ozet_veri['Günlük Değişim (%)']}")
             c2.metric("Sinyal Durumu", ozet_veri["Sinyal"])
             c3.metric("Trend Filtresi", ozet_veri["Trend Yönü"])
-            c4.metric("Birleşik Yapı Sinyali", ozet_veri["Birleşik Yapı Sinyali"])
+            c4.metric("Teknik Sinyal", ozet_veri["Teknik Sinyal"], delta=f"AL {ozet_veri['AL Puanı']} / SAT {ozet_veri['SAT Puanı']}")
+
+            st.subheader("🧭 Teknik Sinyal Puanlaması")
+            sc1, sc2 = st.columns(2)
+            sc1.metric("AL puanı", f"{ozet_veri['AL Puanı']}/100")
+            sc2.metric("SAT puanı", f"{ozet_veri['SAT Puanı']}/100")
+            reason_left, reason_right = st.columns(2)
+            with reason_left:
+                st.markdown("**AL gerekçeleri**")
+                st.markdown(ozet_veri["AL Gerekçeleri"].replace("\n", "  \n"))
+            with reason_right:
+                st.markdown("**SAT gerekçeleri**")
+                st.markdown(ozet_veri["SAT Gerekçeleri"].replace("\n", "  \n"))
+            st.caption(f"AL/SAT aday eşiği: {sinyal_esigi}/100. Puanlar teknik koşulların ağırlıklı toplamıdır; olasılık veya getiri garantisi değildir.")
 
             st.divider()
+            st.subheader("📚 Geçmiş Sinyal Performansı")
+            perf = ozet_veri["Sinyal Performans Özeti"]
+            st.caption("Geçmiş AL/SAT olaylarından sonra fiyatın belirtilen vadede sinyal yönünde hareket etme oranı; işlem maliyetleri dahil değildir.")
+            st.dataframe(perf, use_container_width=True, hide_index=True)
+            st.write("**Piyasa rejimi:**", " · ".join(ozet_veri["Piyasa Rejimi"].values()))
+            if ozet_veri["Veri Kalitesi Notları"]:
+                with st.expander("Veri kalitesi notlari"):
+                    st.write("\n".join(ozet_veri["Veri Kalitesi Notları"]))
 
             # Tahmin Seviyeleri
             col_t1, col_t2, col_t3 = st.columns(3)
@@ -608,7 +977,10 @@ with tab_toplu:
     auto_telegram = st.checkbox("⚡ '🚀 GÜÇLÜ AL' sinyallerini anında Telegram'a gönder", value=True)
 
     if st.button("🔍 Sinyal Taramasını Başlat", type="primary"):
-        h_list = [h.strip().upper() for h in girilen_hisseler.split(",") if h.strip()]
+        h_list = normalize_symbol_list(girilen_hisseler)
+        if not h_list:
+            st.warning("Tarama icin en az bir sembol girin.")
+            st.stop()
         tarama_sonuc = []
         bar = st.progress(0)
 
@@ -617,7 +989,8 @@ with tab_toplu:
                 h, 
                 model_tercihi=secilen_model, 
                 is_bist=is_bist_flag, 
-                sermaye_input=sermaye
+                sermaye_input=sermaye,
+                signal_threshold=sinyal_esigi
             )
             if oz and isinstance(oz, dict):
                 tarama_sonuc.append(oz)
@@ -637,11 +1010,12 @@ with tab_toplu:
         if tarama_sonuc:
             df_res = pd.DataFrame(tarama_sonuc).sort_values(by="Yükseliş İhtimali (%)", ascending=False)
             sutunlar = [
-                "Hisse", "Sinyal", "Birleşik Yapı Sinyali", "Trend Yönü", "Yükseliş İhtimali (%)", 
+                "Hisse", "Sinyal", "Teknik Sinyal", "AL Puanı", "SAT Puanı", "Trend Yönü", "Yükseliş İhtimali (%)", 
                 "Model Başarı Oranı (%)", "Sinyal Hassasiyeti (%)", "Yükseliş Teyit Sayısı", "Kırılım Analizi", "Son Fiyat", 
                 "Tahmin 1 Gun", "Kar Al (Take Profit)", "Stop-Loss"
             ]
             st.dataframe(df_res[sutunlar], use_container_width=True)
+            st.download_button("⬇️ Tarama CSV indir", data=make_scan_csv(tarama_sonuc), file_name="sinyal_taramasi.csv", mime="text/csv")
 
 # ------------------------------------------------------------------------------
 # TAB 3: RİSK VE PORTFÖY HESAPLAYICI
@@ -660,7 +1034,7 @@ with tab_risk:
         max_risk_orani = st.slider("İşlem Başı Maksimum Risk Oranı (%)", 0.5, 5.0, 2.0, 0.1)
 
     if risk_hisse:
-        _, r_ozet = analiz_hesapla(risk_hisse, model_tercihi=secilen_model, is_bist=is_bist_flag, sermaye_input=risk_sermaye)
+        _, r_ozet = analiz_hesapla(risk_hisse, model_tercihi=secilen_model, is_bist=is_bist_flag, sermaye_input=risk_sermaye, signal_threshold=sinyal_esigi)
         if r_ozet and isinstance(r_ozet, dict):
             with r_col2:
                 st.info(f"**Hisse:** `{r_ozet['Hisse']}`")
