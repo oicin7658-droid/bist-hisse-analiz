@@ -185,6 +185,24 @@ def calculate_indicators(df):
     df["Breakout_Up"] = (df["Close"] > df["Breakout_Resistance_20"]) & (df["Volume_Ratio_20"] >= 1.5)
     df["Breakout_Down"] = (df["Close"] < df["Breakout_Support_20"]) & (df["Volume_Ratio_20"] >= 1.5)
 
+    # Smart Market Structure: confirmed pivot breakout signals.
+    pivot_len = 5
+    pivot_window = 2 * pivot_len + 1
+    pivot_high_candidate = df["High"].eq(df["High"].rolling(pivot_window, center=True).max()).shift(pivot_len).fillna(False)
+    pivot_low_candidate = df["Low"].eq(df["Low"].rolling(pivot_window, center=True).min()).shift(pivot_len).fillna(False)
+    df["Structure_Resistance"] = df["High"].where(pivot_high_candidate).ffill()
+    df["Structure_Support"] = df["Low"].where(pivot_low_candidate).ffill()
+    df["Smart_Long"] = (df["Close"] > df["Structure_Resistance"]) & (df["Close"].shift(1) <= df["Structure_Resistance"].shift(1))
+    df["Smart_Short"] = (df["Close"] < df["Structure_Support"]) & (df["Close"].shift(1) >= df["Structure_Support"].shift(1))
+
+    # Institutional Flow contributes only its lower-liquidity SELL signal.
+    inst_pivot_len = 10
+    inst_window = 2 * inst_pivot_len + 1
+    inst_low_candidate = df["Low"].eq(df["Low"].rolling(inst_window, center=True).min()).shift(inst_pivot_len).fillna(False)
+    df["Institutional_Lower_Liquidity"] = df["Low"].where(inst_low_candidate).ffill()
+    df["Institutional_Sell"] = (df["Close"] < df["Institutional_Lower_Liquidity"]) & (df["Close"].shift(1) >= df["Institutional_Lower_Liquidity"].shift(1))
+    df["Merged_Long"] = df["Smart_Long"]
+    df["Merged_Short"] = df["Smart_Short"] | df["Institutional_Sell"]
     return df
 
 
@@ -367,6 +385,7 @@ def analiz_hesapla(symbol_input, model_tercihi="XGBoost", is_bist=True, sermaye_
     latest_sma200 = float(df_cleaned["SMA_200"].iloc[-1])
     latest_atr = float(df_cleaned["ATR"].iloc[-1])
     kirilim = analyze_breakout_levels(df_cleaned)
+    merged_signal = "AL" if bool(df_cleaned["Merged_Long"].iloc[-1]) else ("SAT" if bool(df_cleaned["Merged_Short"].iloc[-1]) else "SİNYAL YOK")
 
     # Trend Yönü Kararı
     if latest_close > latest_sma200 and latest_ema9 > latest_ema21:
@@ -411,6 +430,7 @@ def analiz_hesapla(symbol_input, model_tercihi="XGBoost", is_bist=True, sermaye_
         "Son Fiyat": round(latest_close, 2),
         "Günlük Değişim (%)": round(change_pct, 2),
         "Sinyal": net_sinyal,
+        "Birleşik Yapı Sinyali": merged_signal,
         "Trend Yönü": trend_durumu,
         "Yükseliş İhtimali (%)": round(prob[1] * 100, 1),
         "Model Başarı Oranı (%)": round(acc_score, 1),
@@ -505,7 +525,7 @@ with tab_analiz:
             c1.metric("Son Fiyat", f"{ozet_veri['Son Fiyat']} {para_birimi}", delta=f"%{ozet_veri['Günlük Değişim (%)']}")
             c2.metric("Sinyal Durumu", ozet_veri["Sinyal"])
             c3.metric("Trend Filtresi", ozet_veri["Trend Yönü"])
-            c4.metric("Backtest Başarısı", f"%{ozet_veri['Model Başarı Oranı (%)']}")
+            c4.metric("Birleşik Yapı Sinyali", ozet_veri["Birleşik Yapı Sinyali"])
 
             st.divider()
 
@@ -617,7 +637,7 @@ with tab_toplu:
         if tarama_sonuc:
             df_res = pd.DataFrame(tarama_sonuc).sort_values(by="Yükseliş İhtimali (%)", ascending=False)
             sutunlar = [
-                "Hisse", "Sinyal", "Trend Yönü", "Yükseliş İhtimali (%)", 
+                "Hisse", "Sinyal", "Birleşik Yapı Sinyali", "Trend Yönü", "Yükseliş İhtimali (%)", 
                 "Model Başarı Oranı (%)", "Sinyal Hassasiyeti (%)", "Yükseliş Teyit Sayısı", "Kırılım Analizi", "Son Fiyat", 
                 "Tahmin 1 Gun", "Kar Al (Take Profit)", "Stop-Loss"
             ]
@@ -657,3 +677,4 @@ with tab_risk:
                 st.error(f"🛑 **Maksimum Göze Alınan Kayıp:** `{round(riske_edilen_para, 2)}` {para_birimi}")
         else:
             st.error(f"Hata: {r_ozet}")
+
