@@ -1,3 +1,4 @@
+import os
 import warnings
 import numpy as np
 import pandas as pd
@@ -12,8 +13,8 @@ from xgboost import XGBClassifier
 warnings.filterwarnings("ignore")
 
 # --- SABİT TELEGRAM BİLGİLERİNİZ ---
-DEFAULT_TELEGRAM_TOKEN = "8898496727:AAEaArWqlYX92vLGfJUW1nHzUL-cWFC2otQ"
-DEFAULT_TELEGRAM_CHAT_ID = "1840616371"
+DEFAULT_TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+DEFAULT_TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 # --- SAYFA YAPILANDIRMASI ---
 st.set_page_config(
@@ -388,7 +389,7 @@ if st.sidebar.button("🔔 Test Mesajı Gönder"):
 tab_analiz, tab_toplu = st.tabs(
     [
         "🔍 Tekil Hisse & İnteraktif Grafik",
-        "📊 Toplu BIST Taraması",
+        "📊 Toplu Hisse Taraması",
     ]
 )
 
@@ -486,9 +487,15 @@ with tab_analiz:
 # ==============================================================================
 with tab_toplu:
     st.subheader("📊 Toplu Hisse Taraması & Otomatik Sinyal Gönderimi")
-    varsayilan_metin = "ASELS, TUPRS, THYAO, GARAN, AKBNK, EREGL, BIMAS, SISE, KCHOL, SAHOL, YKBNK, PETKM"
+    if is_bist_flag:
+        varsayilan_metin = "ASELS, TUPRS, THYAO, GARAN, AKBNK, EREGL, BIMAS, SISE, KCHOL, SAHOL, YKBNK, PETKM"
+        piyasa_etiketi = "BIST"
+    else:
+        # NASDAQ'ta işlem gören, yaygın takip edilen şirketler için başlangıç listesi.
+        varsayilan_metin = "AAPL, MSFT, NVDA, AMZN, GOOGL, META, AVGO, TSLA, COST, NFLX, AMD, INTC, QCOM, TXN, AMAT, MU, LRCX, KLAC, ADI, ARM, PLTR, PANW, CRWD, SNPS, CDNS, ASML, MELI, CSCO, AMGN, GILD, ISRG, BKNG, SBUX, MDLZ, PEP, CHTR, TMUS, HON, ADP, CMCSA, REGN, MAR, ORLY, CTAS, DASH, MSTR, APP, COIN, SHOP, ZS"
+        piyasa_etiketi = "NASDAQ / ABD"
     girilen_hisseler = st.text_area(
-        "Taranacak Hisse Kodları:", value=varsayilan_metin, height=100
+        f"{piyasa_etiketi} için taranacak semboller (virgül veya satır ile ayırın):", value=varsayilan_metin, height=120
     )
 
     auto_telegram = st.checkbox(
@@ -498,7 +505,7 @@ with tab_toplu:
 
     if st.button("🔍 Taramayı Başlat", type="primary"):
         h_list = [
-            h.strip().upper() for h in girilen_hisseler.split(",") if h.strip()
+            h.strip().upper() for h in girilen_hisseler.replace("\n", ",").split(",") if h.strip()
         ]
         tarama_sonuc = []
         bar = st.progress(0)
@@ -533,3 +540,4 @@ with tab_toplu:
                 by="Yükseliş İhtimali (%)", ascending=False
             )
             st.dataframe(df_res, use_container_width=True)
+
