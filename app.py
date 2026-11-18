@@ -1,16 +1,11 @@
 import os
-import warnings
-import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import requests
-from sklearn.ensemble import RandomForestClassifier
 import streamlit as st
 import yfinance as yf
-from xgboost import XGBClassifier
-
-warnings.filterwarnings("ignore")
+from technical_analysis import DOWN, UP, analyze_prices, completed_session_cutoff
 
 # --- SABİT TELEGRAM BİLGİLERİNİZ ---
 DEFAULT_TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -18,20 +13,16 @@ DEFAULT_TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 # --- SAYFA YAPILANDIRMASI ---
 st.set_page_config(
-    page_title="PRO BIST & US Yapay Zeka Platformu",
+    page_title="BIST ve ABD Teknik Analiz",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# --- SESSION STATE ---
-if "watchlist" not in st.session_state:
-    st.session_state.watchlist = ["ASELS", "THYAO", "TUPRS", "EREGL", "GARAN"]
-
 # --- BAŞLIK ---
-st.title("⚡ PRO Hisse Analiz & Canlı Takip Platformu")
+st.title("BIST ve ABD Teknik Analiz")
 st.caption(
-    "Yapay Zeka Sinyalleri | İnteraktif Plotly Grafikleri | Telegram Entegre Sistem"
+    "Günlük teknik sinyaller · İnteraktif grafikler · Telegram bildirimleri"
 )
 st.divider()
 
@@ -52,8 +43,8 @@ def send_telegram_message(bot_token, chat_id, message):
             return True, "Başarılı"
         else:
             return False, res_data.get("description", "Bilinmeyen hata")
-    except Exception as e:
-        return False, str(e)
+    except (requests.RequestException, ValueError):
+        return False, "Telegram bağlantısı kurulamadı veya yanıt okunamadı."
 
 
 # --- ÖZEL INTERAKTİF PLOTLY GRAFİK FONKSİYONU ---
@@ -160,196 +151,58 @@ def render_custom_plotly_chart(df, symbol_name):
         height=600,
         margin=dict(l=20, r=20, t=40, b=20),
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
 
-# --- TEKNİK ANALİZ VE YAPAY ZEKA FONKSİYONU ---
 @st.cache_data(ttl=3600, show_spinner=False)
-def analiz_hesapla(
-    symbol_input,
-    model_tercihi="XGBoost",
-    is_bist=True,
-    start_date="2021-01-01",
-):
-    symbol = (
-        f"{symbol_input}.IS"
-        if is_bist and not symbol_input.endswith(".IS")
-        else symbol_input
+def download_prices(symbol, session_cutoff):
+    prices = yf.download(
+        symbol, period="5y", interval="1d", auto_adjust=True,
+        ignore_tz=True, threads=False, progress=False, timeout=10,
     )
+    if prices is None or prices.empty:
+        raise ValueError("Fiyat verisi alınamadı. Sembolü ve Yahoo Finance erişimini kontrol edin.")
+    return prices.loc[prices.index.date <= session_cutoff]
 
+
+def analiz_hesapla(symbol, is_bist, uploaded=None):
+    if is_bist and not symbol.endswith(".IS"):
+        symbol = f"{symbol}.IS"
     try:
-        df = yf.download(symbol, start=start_date, progress=False)
-        if df is None or df.empty or len(df) < 200:
-            return None, "Yetersiz veri veya geçersiz hisse kodu."
-
-        # yfinance MultiIndex sütunlarını düzleştirme
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-
-        # Temel İndikatörler
-        df["Return"] = df["Close"].pct_change()
-        df["Volume_Change"] = df["Volume"].pct_change()
-        df["Vol_SMA_Ratio"] = df["Volume"] / (
-            df["Volume"].rolling(window=20).mean() + 1e-9
-        )
-
-        # RSI & Stoch RSI
-        delta = df["Close"].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-        rs = gain / (loss + 1e-9)
-        df["RSI"] = 100 - (100 / (1 + rs))
-
-        rsi_min = df["RSI"].rolling(window=14).min()
-        rsi_max = df["RSI"].rolling(window=14).max()
-        df["Stoch_RSI"] = (df["RSI"] - rsi_min) / (rsi_max - rsi_min + 1e-9)
-
-        # MACD
-        ema_12 = df["Close"].ewm(span=12, adjust=False).mean()
-        ema_26 = df["Close"].ewm(span=26, adjust=False).mean()
-        df["MACD"] = ema_12 - ema_26
-        df["MACD_Signal"] = df["MACD"].ewm(span=9, adjust=False).mean()
-        df["MACD_Hist"] = df["MACD"] - df["MACD_Signal"]
-
-        # Bollinger Bands & ATR
-        sma_20 = df["Close"].rolling(window=20).mean()
-        std_20 = df["Close"].rolling(window=20).std()
-        df["Upper_Band"] = sma_20 + (std_20 * 2)
-        df["Lower_Band"] = sma_20 - (std_20 * 2)
-        df["Bollinger_PCT"] = (df["Close"] - df["Lower_Band"]) / (
-            df["Upper_Band"] - df["Lower_Band"] + 1e-9
-        )
-
-        high_low = df["High"] - df["Low"]
-        high_close = np.abs(df["High"] - df["Close"].shift())
-        low_close = np.abs(df["Low"] - df["Close"].shift())
-        ranges = pd.concat([high_low, high_close, low_close], axis=1)
-        true_range = np.max(ranges, axis=1)
-        df["ATR"] = true_range.rolling(14).mean()
-        df["ATR_PCT"] = df["ATR"] / df["Close"]
-
-        # 200 SMA
-        df["SMA_200"] = df["Close"].rolling(window=200).mean()
-        df["Trend_200_Ratio"] = df["Close"] / (df["SMA_200"] + 1e-9)
-
-        # Target (Yarınki kapanış bugünkünden yüksek mi?)
-        df["Target"] = np.where(df["Close"].shift(-1) > df["Close"], 1, 0)
-        df_cleaned = df.replace([np.inf, -np.inf], np.nan).dropna()
-
-        features = [
-            "Return",
-            "Volume_Change",
-            "Vol_SMA_Ratio",
-            "RSI",
-            "Stoch_RSI",
-            "MACD",
-            "MACD_Hist",
-            "Bollinger_PCT",
-            "ATR_PCT",
-            "Trend_200_Ratio",
-        ]
-
-        X = df_cleaned[features]
-        y = df_cleaned["Target"]
-
-        if model_tercihi == "XGBoost":
-            model = XGBClassifier(
-                n_estimators=150,
-                max_depth=4,
-                learning_rate=0.03,
-                subsample=0.8,
-                colsample_bytree=0.8,
-                random_state=42,
-                eval_metric="logloss",
-            )
+        if uploaded is None:
+            prices = download_prices(symbol, completed_session_cutoff(is_bist))
         else:
-            model = RandomForestClassifier(
-                n_estimators=150,
-                max_depth=5,
-                min_samples_split=5,
-                class_weight="balanced",
-                random_state=42,
-            )
+            prices = pd.read_csv(uploaded)
+            if "Date" not in prices:
+                raise ValueError("CSV dosyasında Date sütunu bulunmalı.")
+            prices.index = pd.to_datetime(prices.pop("Date"), format="%Y-%m-%d")
+            if prices.index.hasnans:
+                raise ValueError("CSV dosyasındaki her satırın geçerli bir tarihi olmalı.")
+        history, summary = analyze_prices(prices, is_bist)
+    except (ValueError, OSError) as exc:
+        return None, str(exc)
+    summary["Hisse"] = symbol
+    return history, summary
 
-        model.fit(X.iloc[:-1], y.iloc[:-1])
 
-        latest_data = X.iloc[[-1]]
-        prediction = model.predict(latest_data)[0]
-        prob = model.predict_proba(latest_data)[0]
-
-        latest_close = float(df_cleaned["Close"].iloc[-1])
-        prev_close = float(df_cleaned["Close"].iloc[-2])
-        change_pct = ((latest_close - prev_close) / prev_close) * 100
-
-        latest_high = float(df_cleaned["High"].iloc[-1])
-        latest_low = float(df_cleaned["Low"].iloc[-1])
-        latest_stoch = float(df_cleaned["Stoch_RSI"].iloc[-1])
-        latest_atr = float(df_cleaned["ATR"].iloc[-1])
-        trend_ok = float(df_cleaned["Trend_200_Ratio"].iloc[-1]) > 0.98
-
-        pivot = (latest_high + latest_low + latest_close) / 3.0
-        support_1 = (2 * pivot) - latest_high
-        resistance_1 = (2 * pivot) - latest_low
-
-        ideal_entry = round(latest_close - (0.5 * latest_atr), 2)
-        if ideal_entry < support_1:
-            ideal_entry = round(support_1, 2)
-
-        stop_loss = round(ideal_entry - (1.5 * latest_atr), 2)
-
-        sinyal = (
-            "GÜÇLÜ AL"
-            if (prediction == 1 and latest_stoch < 0.85 and trend_ok)
-            else "NÖTR / BEKLE"
-        )
-
-        # 1 Günlük & 1 Haftalık Fiyat Tahminleri
-        up_prob = float(prob[1])
-        direction_factor = (up_prob - 0.5) * 2
-
-        est_1d = latest_close + (direction_factor * latest_atr * 0.7)
-        est_1w = latest_close + (direction_factor * latest_atr * 2.2)
-
-        # Kırılım Noktası Yorumları
-        kirilim_ust = round(resistance_1, 2)
-        kirilim_alt = round(support_1, 2)
-
-        yapan_analiz_metni = (
-            f"📈 **Yukarı Kırılım:** Fiyat `{kirilim_ust}` üzerinde kalıcılık sağlarsa "
-            f"yeni bir ivme ile `{round(kirilim_ust + latest_atr, 2)}` hedeflenebilir.\n\n"
-            f"📉 **Aşağı Kırılım:** Fiyat `{kirilim_alt}` desteğini aşağı kırarsa "
-            f"`{round(kirilim_alt - latest_atr, 2)}` seviyelerine çekilme riski oluşur."
-        )
-
-        ozet = {
-            "Hisse": symbol_input.replace(".IS", ""),
-            "Model": model_tercihi,
-            "Son Fiyat": round(latest_close, 2),
-            "Günlük Değişim (%)": round(change_pct, 2),
-            "İdeal Alış": ideal_entry,
-            "Destek S1": round(support_1, 2),
-            "Direnç R1": round(resistance_1, 2),
-            "Stop-Loss": stop_loss,
-            "Sinyal": sinyal,
-            "Yükseliş İhtimali (%)": round(prob[1] * 100, 1),
-            "RSI": round(float(df_cleaned["RSI"].iloc[-1]), 1),
-            "StochRSI": round(latest_stoch, 2),
-            "Tahmin 1 Gun": round(est_1d, 2),
-            "Tahmin 1 Hafta": round(est_1w, 2),
-            "Kirilim Analizi": yapan_analiz_metni,
-        }
-
-        return df_cleaned, ozet
-    except Exception as e:
-        return None, str(e)
+def format_summary(summary, currency):
+    return (
+        f"*{summary['Hisse']}* | {summary['Son Seans']} kapanışı\n"
+        f"Fiyat: {summary['Son Fiyat']} {currency}\n"
+        f"Sinyal: {summary['Sinyal']}\n"
+        f"RSI: {summary['RSI']} | SMA 200: {summary['SMA 200']} | MACD hist.: {summary['MACD Histogramı']}\n"
+        f"Destek / direnç: {summary['Destek S1']} / {summary['Direnç R1']}"
+    )
 
 
 # --- YAN MENÜ (SIDEBAR) ---
 st.sidebar.header("⚙️ Genel Ayarlar")
-
-secilen_model = st.sidebar.selectbox(
-    "🤖 Yapay Zeka Modeli", ["XGBoost", "Random Forest"]
-)
+with st.sidebar.expander("Teknik sinyal kuralları", expanded=True):
+    st.markdown(
+        "**Yükseliş:** Kapanış SMA 200 üstünde, MACD histogramı pozitif ve 50 < RSI ≤ 70.\n\n"
+        "**Düşüş:** Kapanış SMA 200 altında, MACD histogramı negatif ve 30 ≤ RSI < 50.\n\n"
+        "**Bekle:** Göstergeler bu koşulları birlikte sağlamıyor."
+    )
 
 piyasa = st.sidebar.radio(
     "Piyasa Seçimi", ["BIST (Türk Borsası)", "ABD Borsaları (S&P 500 / Nasdaq)"]
@@ -406,80 +259,52 @@ with tab_analiz:
         .upper()
     )
 
+    uploaded = st.file_uploader(
+        "Günlük fiyat CSV dosyası (isteğe bağlı)", type=["csv"],
+        help="Date (YYYY-MM-DD), Open, High, Low, Close ve Volume sütunları gerekir. Seçilen sembole ait düzeltilmiş günlük OHLC verisini yükleyin.",
+    )
     if hisse_kod:
         with st.spinner(f"{hisse_kod} analiz ediliyor..."):
-            df_data, ozet_veri = analiz_hesapla(
-                hisse_kod,
-                model_tercihi=secilen_model,
-                is_bist=is_bist_flag,
-                start_date="2021-01-01",
-            )
+            df_data, ozet_veri = analiz_hesapla(hisse_kod, is_bist_flag, uploaded)
 
         if df_data is None:
-            st.error(f"Hata: {ozet_veri}")
+            st.error(ozet_veri)
         else:
-            c1, c2, c3, c4, c5 = st.columns(5)
+            st.caption(f"Son tamamlanmış seans {ozet_veri['Son Seans']:%d.%m.%Y} · Günlük, düzeltilmiş fiyatlar")
+            c1, c2, c3, c4 = st.columns(4)
             c1.metric(
-                "Son Fiyat",
+                "Son Kapanış",
                 f"{ozet_veri['Son Fiyat']} {para_birimi}",
-                delta=f"%{ozet_veri['Günlük Değişim (%)']}",
+                delta=f"{ozet_veri['Günlük Değişim (%)']}%",
             )
-            c2.metric(
-                "İdeal Alış Fiyatı", f"{ozet_veri['İdeal Alış']} {para_birimi}"
-            )
-            c3.metric(
-                "Destek / Direnç",
-                f"{ozet_veri['Destek S1']} / {ozet_veri['Direnç R1']}",
-            )
-            c4.metric(
-                "Stop-Loss", f"{ozet_veri['Stop-Loss']} {para_birimi}"
-            )
-            c5.metric("Model Sinyali", ozet_veri["Sinyal"])
+            c2.metric("Destek / Direnç", f"{ozet_veri['Destek S1']} / {ozet_veri['Direnç R1']}")
+            c3.metric("ATR (14 seans)", f"{ozet_veri['ATR (14)']} {para_birimi}")
+            c4.metric("Teknik Sinyal", ozet_veri["Sinyal"])
 
-            # Gelecek Tahminleri
-            st.markdown("### 🎯 Yapay Zeka Tahmini Beklentiler")
-            col_t1, col_t2 = st.columns(2)
-            col_t1.info(
-                f"**1 Gün Sonra Beklenen Fiyat:** `{ozet_veri['Tahmin 1 Gun']} {para_birimi}`"
-            )
-            col_t2.success(
-                f"**1 Hafta Sonra Beklenen Fiyat:** `{ozet_veri['Tahmin 1 Hafta']} {para_birimi}`"
-            )
+            s1, s2, s3 = st.columns(3)
+            s1.metric("SMA 200", ozet_veri["SMA 200"])
+            s2.metric("MACD histogramı", ozet_veri["MACD Histogramı"])
+            s3.metric("RSI (14)", ozet_veri["RSI"])
 
-            # Kırılım Noktaları
-            st.markdown("### ⚡ Kritik Kırılım Noktaları ve Senaryolar")
-            st.write(ozet_veri["Kirilim Analizi"])
+            test = ozet_veri["Test"]
+            if test["signals"]:
+                st.caption(
+                    f"Geçmiş yön testi · {test['sessions']} değerlendirilebilir seans · "
+                    f"{test['signals']} yön sinyalinden {test['hits']} isabet (%{test['accuracy'] * 100:.1f}). "
+                    "Her sinyal bir sonraki seansın kapanışına göre değerlendirilir."
+                )
+            else:
+                st.caption("Geçmiş yön testi için sonucu bilinen yükseliş veya düşüş sinyali bulunamadı.")
 
-            # Telegram Sinyal Butonu
             if st.button("📲 Bu Analizi Telegram'a Gönder"):
-                mesaj = f"""
-🎯 *YAPAY ZEKA HİSSE SİNYALİ*
-📈 *Hisse:* `{ozet_veri['Hisse']}`
-💵 *Son Fiyat:* `{ozet_veri['Son Fiyat']} {para_birimi}` (%{ozet_veri['Günlük Değişim (%)']})
-🚥 *Sinyal:* *{ozet_veri['Sinyal']}*
-📊 *Yükseliş İhtimali:* `%{ozet_veri['Yükseliş İhtimali (%)']}`
-
-🔮 *1 Günlük Tahmin:* `{ozet_veri['Tahmin 1 Gun']} {para_birimi}`
-🔮 *1 Haftalık Tahmin:* `{ozet_veri['Tahmin 1 Hafta']} {para_birimi}`
-
-🎯 *İdeal Alış:* `{ozet_veri['İdeal Alış']} {para_birimi}`
-🛑 *Stop-Loss:* `{ozet_veri['Stop-Loss']} {para_birimi}`
-🛡️ *Destek:* `{ozet_veri['Destek S1']}` | *Direnç:* `{ozet_veri['Direnç R1']}`
-
-📌 *Kırılım Analizi:*
-{ozet_veri['Kirilim Analizi']}
-                """
                 ok, res = send_telegram_message(
-                    telegram_token, telegram_chat_id, mesaj
+                    telegram_token, telegram_chat_id, format_summary(ozet_veri, para_birimi)
                 )
                 if ok:
                     st.success("Analiz Telegram hesabınıza gönderildi!")
                 else:
                     st.error(f"Gönderilemedi: {res}")
 
-            st.divider()
-
-            # Özel Plotly Grafiği
             render_custom_plotly_chart(df_data, ozet_veri["Hisse"])
 
 # ==============================================================================
@@ -499,45 +324,40 @@ with tab_toplu:
     )
 
     auto_telegram = st.checkbox(
-        "⚡ Tarama sırasında yakalanan 'GÜÇLÜ AL' sinyallerini otomatik Telegram'a gönder",
-        value=True,
+        "Tarama sırasında yön sinyallerini Telegram'a gönder",
+        value=False,
+        disabled=not (telegram_token and telegram_chat_id),
     )
 
     if st.button("🔍 Taramayı Başlat", type="primary"):
-        h_list = [
-            h.strip().upper() for h in girilen_hisseler.replace("\n", ",").split(",") if h.strip()
-        ]
-        tarama_sonuc = []
-        bar = st.progress(0)
+        symbols = (item.strip().upper() for item in girilen_hisseler.replace("\n", ",").split(","))
+        h_list = list(dict.fromkeys(symbol for symbol in symbols if symbol))
+        if not h_list:
+            st.warning("Taramak için en az bir sembol girin.")
+        else:
+            results = []
+            failures = []
+            bar = st.progress(0)
+            for idx, symbol in enumerate(h_list, 1):
+                _, summary = analiz_hesapla(symbol, is_bist_flag)
+                if isinstance(summary, str):
+                    failures.append(f"{symbol}: {summary}")
+                else:
+                    if auto_telegram and summary["Sinyal"] in (UP, DOWN):
+                        ok, message = send_telegram_message(
+                            telegram_token, telegram_chat_id, format_summary(summary, para_birimi)
+                        )
+                        if not ok:
+                            st.warning(f"{symbol} bildirimi gönderilemedi: {message}")
+                    results.append({key: value for key, value in summary.items() if key != "Test"})
+                bar.progress(idx / len(h_list))
+            bar.empty()
 
-        for idx, h in enumerate(h_list):
-            _, oz = analiz_hesapla(
-                h,
-                model_tercihi=secilen_model,
-                is_bist=is_bist_flag,
-                start_date="2021-01-01",
-            )
-            if oz and isinstance(oz, dict):
-                tarama_sonuc.append(oz)
-
-                # Otomatik Telegram Bildirimi
-                if auto_telegram and oz["Sinyal"] == "GÜÇLÜ AL":
-                    msg = (
-                        f"⚡ *GÜÇLÜ AL SİNYALİ:* `{oz['Hisse']}`\n"
-                        f"💵 Fiyat: `{oz['Son Fiyat']}` | 🎯 İdeal Alış: `{oz['İdeal Alış']}`\n"
-                        f"🔮 1 Günlük Tahmin: `{oz['Tahmin 1 Gun']}` | 1 Haftalık Tahmin: `{oz['Tahmin 1 Hafta']}`\n"
-                        f"📊 Yükseliş İhtimali: `%{oz['Yükseliş İhtimali (%)']}`"
-                    )
-                    send_telegram_message(
-                        telegram_token, telegram_chat_id, msg
-                    )
-
-            bar.progress((idx + 1) / len(h_list))
-
-        bar.empty()
-        if tarama_sonuc:
-            df_res = pd.DataFrame(tarama_sonuc).sort_values(
-                by="Yükseliş İhtimali (%)", ascending=False
-            )
-            st.dataframe(df_res, use_container_width=True)
-
+            if results:
+                table = pd.DataFrame(results).set_index("Hisse").sort_index()
+                st.dataframe(table, width="stretch")
+            if failures:
+                st.warning(f"{len(failures)} sembol analiz edilemedi.")
+                with st.expander("Analiz hataları", expanded=not results):
+                    for failure in failures:
+                        st.text(failure)
